@@ -161,6 +161,113 @@ Unhealthy: any one taking 30+ seconds confirms registry/network is the culprit �
 
 ---
 
+## Issue #2 — `docker run` fails with `mkdirat ... permission denied` on nested bind mount
+
+**Date:** 2026-05-30
+**Severity:** Runtime (container fails to start)
+**Status:** Workaround documented; not a code bug — bind-mount layout issue
+
+### Symptom
+
+`docker run` returns a container ID but immediately fails with:
+
+```
+docker: Error response from daemon: failed to create task for container:
+failed to create shim task: OCI runtime create failed: runc create failed:
+unable to start container process: error during container init:
+error mounting "/host_mnt/Users/rajendra/openclaw-docker/workspace"
+to rootfs at "/home/node/.openclaw/workspace":
+create mountpoint for /home/node/.openclaw/workspace mount:
+make mountpoint "/home/node/.openclaw/workspace":
+mkdirat /var/lib/docker/rootfs/overlayfs/<id>/home/node/.openclaw/workspace:
+permission denied
+```
+
+### Reproduction
+
+Use **three sibling** host directories with **nested container paths**:
+
+```bash
+mkdir -p ~/openclaw-docker/state ~/openclaw-docker/workspace ~/openclaw-docker/auth-profile-secrets
+
+docker run -d --name openclaw \
+  -v ~/openclaw-docker/state:/home/node/.openclaw \
+  -v ~/openclaw-docker/workspace:/home/node/.openclaw/workspace \
+  -v ~/openclaw-docker/auth-profile-secrets:/home/node/.config/openclaw \
+  ... openclaw:local node openclaw.mjs gateway --allow-unconfigured --bind lan --port 18789
+```
+
+### Root cause
+
+Two bind mounts whose **container paths are nested** but **host paths are siblings**:
+
+- Host `~/openclaw-docker/state` → container `/home/node/.openclaw`
+- Host `~/openclaw-docker/workspace` → container `/home/node/.openclaw/workspace`
+
+When Docker mounts the first, the contents of `/home/node/.openclaw` become whatever is in `~/openclaw-docker/state` — which is empty (the Dockerfile's pre-created `workspace/` subdir is hidden under the bind-mount). When Docker tries to mount the second at `/home/node/.openclaw/workspace`, that subdirectory doesn't exist, so runc tries to `mkdirat` the mountpoint inside the overlay filesystem and Docker Desktop's file-share layer denies it.
+
+The repo's `docker-compose.yml` avoids this by using **nested host paths** for the two mounts (workspace inside the OPENCLAW_CONFIG_DIR by default), so the inner mountpoint exists on the host before Docker tries to use it.
+
+### Fix priority
+
+#### 1. Drop the separate workspace mount — recommended
+
+Workspace is a subdirectory of state on the container anyway. Just put workspace inside state on the host and use **two** mounts instead of three:
+
+```bash
+docker rm -f openclaw
+
+mkdir -p ~/openclaw-docker/state/workspace
+mkdir -p ~/openclaw-docker/auth-profile-secrets
+
+docker run -d --name openclaw \
+  ... \
+  -v ~/openclaw-docker/state:/home/node/.openclaw \
+  -v ~/openclaw-docker/auth-profile-secrets:/home/node/.config/openclaw \
+  -p 127.0.0.1:18789:18789 \
+  openclaw:local \
+  node openclaw.mjs gateway --allow-unconfigured --bind lan --port 18789
+```
+
+#### 2. Keep three mounts but pre-create the nested mountpoint inside state
+
+```bash
+docker rm -f openclaw
+mkdir -p ~/openclaw-docker/state/workspace  # mountpoint must exist inside state
+# ... then re-run with all three -v flags
+```
+
+The bind-mounted `~/openclaw-docker/workspace` then overlays the pre-existing `state/workspace` directory inside the container.
+
+#### 3. Match docker-compose convention with nested host paths
+
+```bash
+mkdir -p ~/.openclaw-host/.openclaw/workspace
+mkdir -p ~/.openclaw-host/.openclaw-secrets
+
+docker run -d --name openclaw \
+  ... \
+  -v ~/.openclaw-host/.openclaw:/home/node/.openclaw \
+  -v ~/.openclaw-host/.openclaw/workspace:/home/node/.openclaw/workspace \
+  -v ~/.openclaw-host/.openclaw-secrets:/home/node/.config/openclaw \
+  ...
+```
+
+### Notes
+
+- This is **not** a real permissions problem. uid 1000 vs your host user uid 501 (macOS) does not cause this specific error — that would surface later as EACCES on writes, not as a runc init failure.
+- Restarting Docker Desktop or `chmod -R 777 ~/openclaw-docker` does **not** fix it. The mountpoint must exist before runc tries to use it.
+- Hint that this is a layout problem and not a privileges problem: `runc` runs as root inside the Docker VM. If it were a true permission issue, it would be on `/var/lib/docker/...` which is owned by root — runc would have access.
+
+### References
+
+- Dockerfile mount-point pre-creation: `Dockerfile:293–301` (the `install -d -m 0700 -o node -g node /home/node/.openclaw/workspace` line — pre-existing dir gets shadowed by the bind mount)
+- Compose default that avoids the trap: `docker-compose.yml:35–36` (nested defaults `${HOME:-/tmp}/.openclaw/workspace`)
+- SETUP doc updated: `bootstrap/SETUP.md` step 3 + step 4
+- Companion: `openclaw-docker-build-and-run.md` § 14 (Common build/run failures)
+
+---
+
 <!--
 ## Issue template for future entries
 

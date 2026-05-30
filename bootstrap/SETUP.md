@@ -106,14 +106,24 @@ $TOKEN
 
 The container runs as `node` (uid 1000). Pre-create the volume directories so Docker doesn't make them root-owned on first start.
 
+Note the layout: **`workspace/` lives inside `state/`** on the host. The container's `/home/node/.openclaw/workspace` path is nested inside `/home/node/.openclaw`, and the host layout has to mirror that. If you create them as separate sibling directories, Docker will fail with a `permission denied` mountpoint error when starting the container (see [troubleshooting](#troubleshooting-quick-reference) and `../ISSUES.md`).
+
 ```bash
-mkdir -p ~/openclaw-docker/state \
-         ~/openclaw-docker/workspace \
-         ~/openclaw-docker/auth-profile-secrets
+mkdir -p ~/openclaw-docker/state/workspace
+mkdir -p ~/openclaw-docker/auth-profile-secrets
 
 # The container is uid 1000. On Linux you need this chown; on macOS Docker
 # Desktop handles uid mapping transparently and chown is a no-op.
 sudo chown -R 1000:1000 ~/openclaw-docker 2>/dev/null || true
+```
+
+Resulting host layout:
+
+```
+~/openclaw-docker/
+├── state/                       <-- mounts to /home/node/.openclaw
+│   └── workspace/               <-- exposed at /home/node/.openclaw/workspace
+└── auth-profile-secrets/        <-- mounts to /home/node/.config/openclaw
 ```
 
 ---
@@ -137,7 +147,6 @@ docker run -d \
   -e OPENCLAW_GATEWAY_TOKEN="$TOKEN" \
   -e TZ=UTC \
   -v ~/openclaw-docker/state:/home/node/.openclaw \
-  -v ~/openclaw-docker/workspace:/home/node/.openclaw/workspace \
   -v ~/openclaw-docker/auth-profile-secrets:/home/node/.config/openclaw \
   -p 127.0.0.1:18789:18789 \
   openclaw:local \
@@ -147,10 +156,11 @@ docker run -d \
     --port 18789
 ```
 
-Three things to know:
+Four things to know:
 - `--allow-unconfigured` is the documented flag that lets the Gateway start with no `openclaw.json` (`src/cli/gateway-run-argv.ts:18`).
 - `--bind lan` is required because we use `-p 127.0.0.1:18789:18789` (bridge networking). Without it the Gateway binds container-loopback and is unreachable from the host. The doc warning in the Dockerfile (lines 313–321) spells this out.
 - The token is **mandatory** for non-loopback bind. The Gateway refuses to start without one (*"refusing to bind gateway ... without auth"*).
+- Only **two** bind mounts. The workspace lives inside `state/` on the host, so it's exposed automatically through the state mount at `/home/node/.openclaw/workspace`. Mounting workspace separately into a nested container path triggers a runc `mkdirat ... permission denied` on Docker Desktop. The OpenClaw compose file uses nested host paths to avoid the same trap.
 
 ---
 
@@ -349,9 +359,10 @@ That's your confirmation that OpenAI is hooked up and reachable.
 
 ## Step 12 — Verify the config persisted
 
-The container has a bind-mounted state directory (`~/openclaw-docker/state`), so `openclaw.json` is now sitting on your host filesystem:
+The container has a bind-mounted state directory (`~/openclaw-docker/state`), so `openclaw.json` is now sitting on your host filesystem. The workspace, sessions, and credentials directories all live inside it too:
 
 ```bash
+ls -la ~/openclaw-docker/state/
 cat ~/openclaw-docker/state/openclaw.json
 ```
 
@@ -460,6 +471,7 @@ The image (`openclaw:local`) sticks around even after `docker rm` so the next ru
 
 | Symptom | Fix |
 |---|---|
+| `docker run` fails with `mkdirat /var/lib/docker/rootfs/.../workspace: permission denied` | Nested-mount mountpoint missing. `docker rm -f openclaw && mkdir -p ~/openclaw-docker/state/workspace`, then re-run with **two** bind mounts (state + auth-profile-secrets), not three. See step 3 + step 4. |
 | `docker run` says `port already in use: 18789` | Stop any other Gateway: `docker rm -f openclaw && lsof -ti :18789 \| xargs kill` |
 | `curl http://127.0.0.1:18789/healthz` returns nothing | Container probably failed to start — `docker logs openclaw` |
 | `AUTH_TOKEN_MISMATCH` from `npm run health` | `.env`'s token doesn't match the one passed to `docker run`. Re-read `~/.openclaw-secrets/gateway-token`. |
