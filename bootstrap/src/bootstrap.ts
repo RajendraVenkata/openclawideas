@@ -71,9 +71,24 @@ async function main(): Promise<void> {
         : "");
 
   if (openaiKey || anthropicKey) {
-    const providers: Record<string, { apiKey: string }> = {};
-    if (openaiKey) providers["openai"] = { apiKey: openaiKey };
-    if (anthropicKey) providers["anthropic"] = { apiKey: anthropicKey };
+    type ProviderConfig = { apiKey: string; baseUrl: string };
+    const providers: Record<string, ProviderConfig> = {};
+    if (openaiKey) {
+      providers["openai"] = {
+        apiKey: openaiKey,
+        // The Gateway's config validator requires baseUrl to be a non-empty
+        // string when an openai provider block is declared. Override via
+        // OPENAI_BASE_URL if you're using Azure OpenAI / vLLM / a proxy.
+        baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+      };
+    }
+    if (anthropicKey) {
+      providers["anthropic"] = {
+        apiKey: anthropicKey,
+        baseUrl:
+          process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
+      };
+    }
 
     const configured = Object.keys(providers).join(" + ");
 
@@ -90,7 +105,7 @@ async function main(): Promise<void> {
         // Docs: docs/concepts/session.md (DM isolation section).
         session: { dmScope: "per-channel-peer" },
       };
-      return client.rpc("config.patch", { raw: JSON.stringify(patch) });
+      return configPatch(client, patch);
     });
 
     await step("models.list (configured)", async () => {
@@ -124,7 +139,7 @@ async function main(): Promise<void> {
           },
         },
       };
-      return client.rpc("config.patch", { raw: JSON.stringify(patch) });
+      return configPatch(client, patch);
     });
 
     await step("channels.start telegram", async () => {
@@ -155,6 +170,36 @@ async function main(): Promise<void> {
 
   console.log("\n✓ bootstrap complete");
   await client.close();
+}
+
+/**
+ * Patch config with optimistic-concurrency `baseHash`.
+ *
+ * The Gateway requires a baseHash on config writes once the active config
+ * has any state, to avoid two writers clobbering each other. From the error
+ * message: "config base hash required; re-run config.get and retry".
+ *
+ * We fetch the current snapshot, extract the hash (the field name may be
+ * `hash` or `baseHash` depending on Gateway version — handle both), and
+ * include it in the patch. After a successful patch the hash changes, so
+ * each patch re-fetches.
+ */
+async function configPatch(
+  client: GatewayClient,
+  patch: Record<string, unknown>,
+): Promise<unknown> {
+  const current = await client.rpc<Record<string, unknown>>("config.get", {});
+  const hash =
+    typeof current["hash"] === "string"
+      ? (current["hash"] as string)
+      : typeof current["baseHash"] === "string"
+        ? (current["baseHash"] as string)
+        : undefined;
+
+  return client.rpc("config.patch", {
+    raw: JSON.stringify(patch),
+    ...(hash ? { baseHash: hash } : {}),
+  });
 }
 
 /** Helper that logs a step name, runs it, and pretty-prints the result. */

@@ -111,11 +111,22 @@ Note the layout: **`workspace/` lives inside `state/`** on the host. The contain
 ```bash
 mkdir -p ~/openclaw-docker/state/workspace
 mkdir -p ~/openclaw-docker/auth-profile-secrets
-
-# The container is uid 1000. On Linux you need this chown; on macOS Docker
-# Desktop handles uid mapping transparently and chown is a no-op.
-sudo chown -R 1000:1000 ~/openclaw-docker 2>/dev/null || true
 ```
+
+### macOS: do NOT chown
+
+Docker Desktop on macOS uses virtiofs to translate host file ownership into the container automatically. Manually `chown`-ing the host directory to uid 1000 actually **breaks** that translation — the host user can't write to it and the container's `node` user can't either. Skip the chown on Mac.
+
+### Linux native Docker: chown to uid 1000
+
+On Linux, the container's `node` user (uid 1000) needs to own the host directories so it can write into them:
+
+```bash
+# Linux ONLY
+sudo chown -R 1000:1000 ~/openclaw-docker
+```
+
+If you accidentally ran this on macOS, recover with `sudo chmod -R 777 ~/openclaw-docker` (and see Issue #3 in `../ISSUES.md` for the full story).
 
 Resulting host layout:
 
@@ -217,6 +228,42 @@ curl -fsS https://api.openai.com/v1/models \
 ```
 
 You should see JSON listing your available models. If you get `401 Unauthorized`, the key is wrong — regenerate.
+
+---
+
+## Step 7.5 — Seed the device-auth override
+
+The bootstrap script connects from your Mac through Docker's port-forwarder. From inside the container, that connection arrives on the Docker bridge interface — **not loopback** — so the "trusted same-process backend client" exception doesn't apply. The Gateway clears your declared scopes to `[]` and scope-gated RPCs fail with `missing scope: operator.read`.
+
+The documented escape hatch is `gateway.controlUi.dangerouslyDisableDeviceAuth: true`. It preserves declared scopes for device-less operator connections.
+
+> **Tradeoff:** anyone with your `OPENCLAW_GATEWAY_TOKEN` gets full operator scope. Since the container is bound to `127.0.0.1` and your token lives only on your Mac, the practical exposure is no worse than a leaked API key. For production deployments with non-loopback bind, use real device pairing instead — see `../openclaw-gateway-websocket-setup.md` § Pairing.
+
+Always write this file from **inside the container** to avoid host-side permission issues (especially on macOS where Docker Desktop's uid translation can fight you):
+
+```bash
+docker exec -i openclaw sh -c 'cat > /home/node/.openclaw/openclaw.json' <<'EOF'
+{
+  "gateway": {
+    "controlUi": {
+      "dangerouslyDisableDeviceAuth": true
+    }
+  }
+}
+EOF
+
+# Verify it landed
+docker exec openclaw cat /home/node/.openclaw/openclaw.json
+
+# Restart so the Gateway picks up the new config on startup
+docker restart openclaw
+
+# Confirm it's healthy
+sleep 5
+curl -fsS http://127.0.0.1:18789/healthz
+```
+
+If you get `sh: cannot create ...: Permission denied`, your host directory perms are blocking the bind-mounted write. Fix with `sudo chmod -R 777 ~/openclaw-docker` and retry.
 
 ---
 
@@ -472,9 +519,14 @@ The image (`openclaw:local`) sticks around even after `docker rm` so the next ru
 | Symptom | Fix |
 |---|---|
 | `docker run` fails with `mkdirat /var/lib/docker/rootfs/.../workspace: permission denied` | Nested-mount mountpoint missing. `docker rm -f openclaw && mkdir -p ~/openclaw-docker/state/workspace`, then re-run with **two** bind mounts (state + auth-profile-secrets), not three. See step 3 + step 4. |
+| `zsh: permission denied` writing to `~/openclaw-docker/state/openclaw.json` | You ran the macOS chown that step 3 used to suggest. Fix: `sudo chmod -R 777 ~/openclaw-docker`, then seed config via `docker exec` (step 7.5). See ISSUES.md #3. |
+| `sh: cannot create /home/node/.openclaw/openclaw.json: Permission denied` (inside container) | Same root cause as the previous row. `sudo chmod -R 777 ~/openclaw-docker` and retry the `docker exec` write. |
+| RPC fails with `missing scope: operator.read` even after `hello-ok` | Declared scopes were cleared because connection isn't loopback. You skipped step 7.5 — seed the `dangerouslyDisableDeviceAuth: true` config and restart the container. |
+| `scopes negotiated:` line is empty in `npm run health` | Same as above — see step 7.5. |
 | `docker run` says `port already in use: 18789` | Stop any other Gateway: `docker rm -f openclaw && lsof -ti :18789 \| xargs kill` |
 | `curl http://127.0.0.1:18789/healthz` returns nothing | Container probably failed to start — `docker logs openclaw` |
 | `AUTH_TOKEN_MISMATCH` from `npm run health` | `.env`'s token doesn't match the one passed to `docker run`. Re-read `~/.openclaw-secrets/gateway-token`. |
+| `OPENCLAW_GATEWAY_TOKEN is not set` from any script | You're in a new shell — re-export: `export OPENCLAW_GATEWAY_TOKEN="$(cat ~/.openclaw-secrets/gateway-token)"`. |
 | `PAIRING_REQUIRED` from any script | You're not on loopback. SSH-tunnel: `ssh -L 18789:127.0.0.1:18789 user@host` |
 | `models.authStatus` shows `openai: { status: "error" }` | Bad OpenAI key, or OpenAI's API is down. Re-test with the `curl` command from step 7. |
 | `INVALID_REQUEST` on `config.patch` | `raw` isn't a string. Always `JSON.stringify(...)`. The schema is in `src/gateway/protocol/schema/config.ts`. |
