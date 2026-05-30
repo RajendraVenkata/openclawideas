@@ -56,9 +56,26 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${GATEWAY_CONTAINER}\$"; then
   exit 1
 fi
 
+# The bootstrap project's package.json uses "file:../../openclaw/packages/sdk"
+# for the @openclaw/sdk dependency. From /work inside the sidecar, that path
+# resolves to /openclaw/packages/sdk — so we mount the openclaw repo there.
+OPENCLAW_REPO="$(cd "$(dirname "$0")/../../openclaw" && pwd)"
+if [ ! -f "${OPENCLAW_REPO}/packages/sdk/dist/index.mjs" ]; then
+  echo "✗ @openclaw/sdk not built at ${OPENCLAW_REPO}/packages/sdk/dist/" >&2
+  echo "  Build it once with: cd ${OPENCLAW_REPO}/packages/sdk && pnpm build" >&2
+  exit 1
+fi
+
+# Use a named docker volume for the sidecar's node_modules so:
+#  (a) host-installed darwin binaries don't conflict with the Linux sidecar
+#  (b) `npm install` only runs the first time; later runs reuse the volume
+SIDECAR_DEPS_VOLUME="${OPENCLAW_SIDECAR_DEPS_VOLUME:-openclaw-bootstrap-deps}"
+
 exec docker run "${DOCKER_INTERACTIVE_FLAGS[@]}" \
   --network="container:${GATEWAY_CONTAINER}" \
   -v "$(pwd)":/work \
+  -v "${SIDECAR_DEPS_VOLUME}":/work/node_modules \
+  -v "${OPENCLAW_REPO}":/openclaw:ro \
   -w /work \
   -e OPENCLAW_GATEWAY_URL="ws://127.0.0.1:18789" \
   -e OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
@@ -70,4 +87,4 @@ exec docker run "${DOCKER_INTERACTIVE_FLAGS[@]}" \
   -e TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
   -e TELEGRAM_USER_ID="${TELEGRAM_USER_ID:-}" \
   "${NODE_IMAGE}" \
-  sh -c "npm install --no-audit --no-fund --silent && npm run ${SCRIPT}"
+  sh -c "npm install --no-audit --no-fund --silent --no-package-lock && npm run ${SCRIPT}"

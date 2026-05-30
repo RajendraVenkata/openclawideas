@@ -1,67 +1,80 @@
 /**
- * End-to-end Gateway configuration over WebSocket.
+ * End-to-end Gateway configuration over WebSocket — SDK version.
  *
- *   $ npm run bootstrap
+ *   $ ./run-in-sidecar.sh bootstrap
+ *
+ * Uses @openclaw/sdk (file: dep from the local openclaw monorepo) for
+ * namespaced calls, and the raw GatewayClientTransport for surfaces the
+ * SDK doesn't wrap yet (config.*, channels.*).
  *
  * What it does (each step is idempotent and gated by env vars — set only
  * what you want to configure):
  *
- *   1. Connect + verify hello-ok.
- *   2. Health check.
- *   3. Read current models / channels / agents (snapshot of state-before).
- *   4. Apply default workspace + model + provider key
- *      (if ANTHROPIC_API_KEY is set).
- *   5. Register the Telegram channel
+ *   1. Connect + verify SDK transport.
+ *   2. Read current models / channels / agents (snapshot of state-before).
+ *   3. Apply default workspace + model + provider key
+ *      (if OPENAI_API_KEY or ANTHROPIC_API_KEY is set).
+ *   4. Register the Telegram channel
  *      (if TELEGRAM_BOT_TOKEN and TELEGRAM_USER_ID are set).
- *   6. Start the Telegram channel.
- *   7. Verify final status with a live channel probe.
+ *   5. Start the Telegram channel.
+ *   6. Verify final status with a live channel probe.
  *
- * Grounded in the repo:
- *   - methods: src/gateway/methods/core-descriptors.ts
- *   - param schemas: src/gateway/protocol/schema/channels.ts, config.ts,
- *     agents-models-skills.ts
+ * Architecture:
+ *   - oc.models.*    via SDK ModelsNamespace
+ *   - oc.agents.*    via SDK AgentsNamespace
+ *   - transport.request("config.*")    raw escape hatch (no SDK wrapper)
+ *   - transport.request("channels.*")  raw escape hatch
  *
- * Key correctness note from config.ts: ConfigPatchParams.raw is a STRING
- * (JSON5 text), NOT an object. Always pass JSON.stringify(...).
+ * Key correctness notes:
+ *   - ConfigPatchParams.raw is a STRING (JSON5 text), NOT an object. Always
+ *     pass JSON.stringify(...).
+ *   - config.patch requires baseHash (optimistic concurrency). The
+ *     configPatch() helper handles fetch-current-hash-then-patch.
+ *   - models.providers.<id>.baseUrl is validated as required non-empty.
  */
 
-import { GatewayClient, readEnv } from "./client.js";
+import { GatewayClientTransport, OpenClaw } from "@openclaw/sdk";
 
 const WORKSPACE_PATH = "/home/node/.openclaw/workspace";
 
+function readEnv(): { url: string; token: string } {
+  const url = process.env.OPENCLAW_GATEWAY_URL ?? "ws://127.0.0.1:18789";
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN;
+  if (!token) {
+    throw new Error(
+      "OPENCLAW_GATEWAY_TOKEN is not set. Export it or put it in .env.",
+    );
+  }
+  return { url, token };
+}
+
 async function main(): Promise<void> {
   const { url, token } = readEnv();
-  const client = new GatewayClient({ url, token });
+
+  // We construct the transport ourselves so we can use it for raw RPCs
+  // alongside the SDK's typed namespaces.
+  const transport = new GatewayClientTransport({ url, token });
+  const oc = new OpenClaw({ transport });
 
   console.log(`→ connecting to ${url}`);
-  const hello = await client.connect();
-  console.log(`✓ connected to OpenClaw ${hello.server.version}`);
-  console.log(`  scopes negotiated: ${hello.auth.scopes.join(", ")}`);
-
-  await step("health", async () => {
-    const r = await client.rpc("health", {});
-    return r;
-  });
+  await oc.connect();
+  console.log("✓ connected via @openclaw/sdk");
 
   // === Snapshot state-before ===
-  await step("models.list (state-before)", async () => {
-    return client.rpc("models.list", { view: "configured" });
-  });
+  await step("models.list (state-before)", async () =>
+    oc.models.list({ view: "configured" }),
+  );
 
-  await step("channels.status (state-before)", async () => {
-    return client.rpc("channels.status", {});
-  });
+  await step("channels.status (state-before)", async () =>
+    transport.request("channels.status", {}),
+  );
 
-  await step("agents.list (state-before)", async () => {
-    return client.rpc("agents.list", {});
-  });
+  await step("agents.list (state-before)", async () => oc.agents.list());
 
   // === Provider key + default model ===
-  // Configure whichever provider keys are set. Both can coexist.
   const openaiKey = process.env.OPENAI_API_KEY;
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
 
-  // Pick a default model based on what's available, unless overridden.
   const defaultModel =
     process.env.OPENCLAW_DEFAULT_MODEL ||
     (openaiKey
@@ -76,24 +89,24 @@ async function main(): Promise<void> {
     if (openaiKey) {
       providers["openai"] = {
         apiKey: openaiKey,
-        // The Gateway's config validator requires baseUrl to be a non-empty
-        // string when an openai provider block is declared. Override via
-        // OPENAI_BASE_URL if you're using Azure OpenAI / vLLM / a proxy.
-        baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+        // Use || (not ??) so an empty-string env value falls back too.
+        // The sidecar wrapper passes -e OPENAI_BASE_URL="${OPENAI_BASE_URL:-}",
+        // which means an unset host var arrives as "" inside the container.
+        baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
       };
     }
     if (anthropicKey) {
       providers["anthropic"] = {
         apiKey: anthropicKey,
         baseUrl:
-          process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
+          process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
       };
     }
 
     const configured = Object.keys(providers).join(" + ");
 
-    await step(`config.patch — ${configured} provider + default model`, async () => {
-      const patch = {
+    await step(`config.patch — ${configured} provider + default model`, async () =>
+      configPatch(transport, {
         models: { providers },
         agents: {
           defaults: {
@@ -101,20 +114,15 @@ async function main(): Promise<void> {
             model: defaultModel,
           },
         },
-        // Recommended for any setup that may serve multiple senders.
-        // Docs: docs/concepts/session.md (DM isolation section).
         session: { dmScope: "per-channel-peer" },
-      };
-      return configPatch(client, patch);
-    });
+      }),
+    );
 
-    await step("models.list (configured)", async () => {
-      return client.rpc("models.list", { view: "configured" });
-    });
+    await step("models.list (configured)", async () =>
+      oc.models.list({ view: "configured" }),
+    );
 
-    await step("models.authStatus", async () => {
-      return client.rpc("models.authStatus", {});
-    });
+    await step("models.status", async () => oc.models.status({}));
   } else {
     console.log(
       "⊘ skipping model setup — set OPENAI_API_KEY or ANTHROPIC_API_KEY in .env",
@@ -126,33 +134,31 @@ async function main(): Promise<void> {
   const telegramUserId = process.env.TELEGRAM_USER_ID;
 
   if (telegramToken && telegramUserId) {
-    await step("config.patch — Telegram channel", async () => {
-      const patch = {
+    await step("config.patch — Telegram channel", async () =>
+      configPatch(transport, {
         channels: {
           telegram: {
             enabled: true,
             botToken: telegramToken,
-            // allowlist is fully WS-driven; we skip the local CLI pairing flow.
             dmPolicy: "allowlist",
             allowFrom: [telegramUserId],
             groupPolicy: "allowlist",
           },
         },
-      };
-      return configPatch(client, patch);
-    });
+      }),
+    );
 
-    await step("channels.start telegram", async () => {
-      return client.rpc("channels.start", { channel: "telegram" });
-    });
+    await step("channels.start telegram", async () =>
+      transport.request("channels.start", { channel: "telegram" }),
+    );
 
-    await step("channels.status telegram (probed)", async () => {
-      return client.rpc("channels.status", {
+    await step("channels.status telegram (probed)", async () =>
+      transport.request("channels.status", {
         channel: "telegram",
         probe: true,
         timeoutMs: 8000,
-      });
-    });
+      }),
+    );
   } else {
     console.log(
       "⊘ skipping Telegram setup — set TELEGRAM_BOT_TOKEN and TELEGRAM_USER_ID in .env",
@@ -160,16 +166,14 @@ async function main(): Promise<void> {
   }
 
   // === Final snapshot ===
-  await step("channels.status (final)", async () => {
-    return client.rpc("channels.status", { probe: true, timeoutMs: 8000 });
-  });
+  await step("channels.status (final)", async () =>
+    transport.request("channels.status", { probe: true, timeoutMs: 8000 }),
+  );
 
-  await step("agents.list (final)", async () => {
-    return client.rpc("agents.list", {});
-  });
+  await step("agents.list (final)", async () => oc.agents.list());
 
   console.log("\n✓ bootstrap complete");
-  await client.close();
+  await oc.close();
 }
 
 /**
@@ -183,12 +187,19 @@ async function main(): Promise<void> {
  * `hash` or `baseHash` depending on Gateway version — handle both), and
  * include it in the patch. After a successful patch the hash changes, so
  * each patch re-fetches.
+ *
+ * This lives outside the SDK because @openclaw/sdk has no `config`
+ * namespace yet. When it adds one, replace these two transport.request
+ * calls with `oc.config.patch({...})`.
  */
 async function configPatch(
-  client: GatewayClient,
+  transport: GatewayClientTransport,
   patch: Record<string, unknown>,
 ): Promise<unknown> {
-  const current = await client.rpc<Record<string, unknown>>("config.get", {});
+  const current = (await transport.request("config.get", {})) as Record<
+    string,
+    unknown
+  >;
   const hash =
     typeof current["hash"] === "string"
       ? (current["hash"] as string)
@@ -196,7 +207,7 @@ async function configPatch(
         ? (current["baseHash"] as string)
         : undefined;
 
-  return client.rpc("config.patch", {
+  return transport.request("config.patch", {
     raw: JSON.stringify(patch),
     ...(hash ? { baseHash: hash } : {}),
   });
@@ -208,7 +219,6 @@ async function step<T>(name: string, fn: () => Promise<T>): Promise<T> {
   try {
     const result = await fn();
     const printable = JSON.stringify(result, null, 2);
-    // Trim huge payloads so the log stays scannable.
     const trimmed =
       printable.length > 4000
         ? printable.slice(0, 4000) + "\n... (truncated)"
@@ -219,9 +229,7 @@ async function step<T>(name: string, fn: () => Promise<T>): Promise<T> {
     const e = err as Error & { gatewayError?: unknown };
     console.error(`✗ ${name} failed: ${e.message}`);
     if (e.gatewayError) {
-      console.error(
-        `  details: ${JSON.stringify(e.gatewayError, null, 2)}`,
-      );
+      console.error(`  details: ${JSON.stringify(e.gatewayError, null, 2)}`);
     }
     throw err;
   }

@@ -10,7 +10,7 @@ Three runnable scripts. Run them through the sidecar wrapper — **not** plain `
 | Bootstrap | `./run-in-sidecar.sh bootstrap` | Connect, snapshot state, apply provider + model + Telegram config, verify. Idempotent. Handles `config.get` → `baseHash` → `config.patch` for you. |
 | Watch | `./run-in-sidecar.sh watch` | Subscribe to live events. Lets you see channel inbound traffic as it arrives. |
 
-No `@openclaw/sdk` dep — raw `ws` so the protocol is fully visible. Read `src/client.ts` to see the handshake on the wire.
+Uses `@openclaw/sdk` (the private monorepo SDK, installed as a `file:` dep from `../../openclaw/packages/sdk`). The SDK handles connection lifecycle, typed namespaces (`oc.models`, `oc.agents`, `oc.sessions`, etc.), and event streaming. For the surfaces the SDK doesn't wrap (`config.*`, `channels.*`), we use the SDK's `GatewayClientTransport.request(method, params)` directly.
 
 ### Why the sidecar?
 
@@ -141,15 +141,16 @@ Filters out `tick` / `heartbeat` noise by default. Ctrl-C to stop.
 
 ```
 bootstrap/
-├── package.json
+├── package.json          # @openclaw/sdk via "file:../../openclaw/packages/sdk"
 ├── tsconfig.json
 ├── .env.example
 ├── .gitignore
 ├── README.md
 ├── SETUP.md              # From-zero walkthrough (start here for first install)
+├── ARCHITECTURE.md       # How the code works (SDK + transport layering)
+├── ISSUES.md             # Known gotchas with workarounds (lives at openclawideas/)
 ├── run-in-sidecar.sh     # Wrapper that runs scripts in a network-shared sidecar
 └── src/
-    ├── client.ts         # Reusable WS client + RPC + event subscription
     ├── health.ts         # Smoke test (./run-in-sidecar.sh health)
     ├── bootstrap.ts      # Full configuration (./run-in-sidecar.sh bootstrap)
     └── watch-status.ts   # Live event stream (./run-in-sidecar.sh watch)
@@ -188,24 +189,29 @@ For the SaaS / multi-tenant case the right answer is usually a separate Gateway 
 
 ## Extending the bootstrap
 
-Add new steps to `bootstrap.ts` by copy-pasting the `await step("name", async () => { ... })` pattern. **Always use `configPatch(client, {...})` instead of raw `client.rpc("config.patch", ...)`** — it fetches the current hash and includes it as `baseHash`, which the Gateway requires.
+Add new steps to `bootstrap.ts` by copy-pasting the `await step("name", async () => { ... })` pattern. Pick the right call layer:
 
-The methods you'll most likely want next (all on the same WS surface, all with schemas in `src/gateway/protocol/schema/*.ts`):
+| Operation | Use |
+|---|---|
+| Has a typed SDK namespace (`agents`, `models`, `sessions`, `runs`, `tasks`, `tools`, `artifacts`, `approvals`) | `oc.<namespace>.<method>(...)` |
+| `config.patch` (provider keys, channel config, bindings) | `configPatch(transport, {...})` — handles `baseHash` automatically |
+| `config.get`, `channels.*`, `web.login.*`, `cron.*`, anything else | `transport.request("<method>", {...})` |
+
+Examples:
 
 ```typescript
-// Create an isolated per-tenant agent
+// Create an isolated per-tenant agent (SDK typed)
 await step("agents.create work", async () =>
-  client.rpc("agents.create", {
+  oc.agents.create({
     name: "work",
     workspace: "/home/node/.openclaw/workspace-work",
     model: "anthropic/claude-sonnet-4-6",
   }),
 );
 
-// Bind a Telegram account to that agent
-//   note: configPatch (not raw rpc) — handles baseHash automatically
+// Bind a Telegram account to that agent (config.patch — use the helper)
 await step("config.patch — binding", async () =>
-  configPatch(client, {
+  configPatch(transport, {
     bindings: [
       {
         agentId: "work",
@@ -215,9 +221,9 @@ await step("config.patch — binding", async () =>
   }),
 );
 
-// Schedule a recurring agent run (every day at 9am UTC)
+// Schedule a recurring agent run (no SDK namespace for cron — raw transport)
 await step("cron.add daily news digest", async () =>
-  client.rpc("cron.add", {
+  transport.request("cron.add", {
     job: {
       id: "daily-news",
       schedule: "0 9 * * *",
@@ -226,19 +232,23 @@ await step("cron.add daily news digest", async () =>
   }),
 );
 
-// Inspect a config slice
+// Inspect a config slice (config.schema.lookup is not in the SDK)
 await step("config.schema.lookup channels.msteams", async () =>
-  client.rpc("config.schema.lookup", { path: "channels.msteams" }),
+  transport.request("config.schema.lookup", { path: "channels.msteams" }),
 );
 ```
 
 For WhatsApp specifically you also need `web.login.start` / `web.login.wait` (QR loop) — see `openclaw-channels-via-websocket.md` § 4 for the exact pattern.
 
-### Two gotchas to know when writing your own `config.patch` calls
+### Three gotchas when writing your own `config.patch` calls
 
 1. **`raw` is a JSON5 string.** Always `JSON.stringify(yourPatchObject)`. If you forget, the validator returns `INVALID_REQUEST`.
 2. **`baseHash` is required at runtime** even though the schema marks it optional. Use the `configPatch` helper. The Gateway uses optimistic concurrency to prevent two writers from clobbering each other.
 3. **Provider entries require `baseUrl`.** If you add a new provider in a `config.patch`, include both `apiKey` and `baseUrl` (non-empty string). For OpenAI: `https://api.openai.com/v1`. For Anthropic: `https://api.anthropic.com`. The Gateway's validator fails the patch otherwise.
+
+### When the SDK adds `config.*` and `channels.*` namespaces
+
+Replace `configPatch(transport, {...})` with `oc.config.patch({...})` and `transport.request("channels.start", {...})` with `oc.channels.start({...})`. The transport stays as a transport — the only diff is where the methods live.
 
 ---
 

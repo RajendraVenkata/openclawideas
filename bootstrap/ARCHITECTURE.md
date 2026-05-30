@@ -8,22 +8,47 @@ Audience: anyone who's read `SETUP.md` and wants to extend the code or understan
 
 ## 1. What this project is
 
-A **standalone WebSocket client** that configures an OpenClaw Gateway from outside the Gateway process. It does not use `@openclaw/sdk` — it implements the WS protocol from scratch in `src/client.ts` so the wire format is fully visible.
+A **standalone client** that configures an OpenClaw Gateway from outside the Gateway process. It uses `@openclaw/sdk` (the private OpenClaw monorepo SDK, installed as a `file:` dep from `../../openclaw/packages/sdk`) for typed namespace calls, and the SDK's `GatewayClientTransport` directly for surfaces the SDK doesn't wrap yet (`config.*`, `channels.*`, `web.login.*`).
 
 Three layers:
 
-| Layer | File | Job |
+| Layer | Provided by | Job |
 |---|---|---|
-| **Transport** | `src/client.ts` | WebSocket connection, frame parsing, request correlation, event subscription |
-| **Orchestration** | `src/bootstrap.ts` | Sequence of RPCs to configure provider + model + channel; idempotent |
+| **Transport** | `@openclaw/sdk` (`GatewayClientTransport`) | WebSocket connection, frame parsing, request correlation, event subscription |
+| **Typed surface** | `@openclaw/sdk` (`OpenClaw` + namespaces) | `oc.agents`, `oc.models`, `oc.sessions`, `oc.runs`, etc. |
+| **Orchestration** | `src/bootstrap.ts` (this project) | Sequence of RPCs to configure provider + model + channel; idempotent |
 | **Runtime wrapper** | `run-in-sidecar.sh` | Runs orchestration inside a Docker sidecar that shares the gateway's network namespace |
 
-Two smaller scripts use the same transport layer:
+Two smaller scripts use the same SDK + transport pair:
 
 | File | Job |
 |---|---|
 | `src/health.ts` | One-shot smoke test |
-| `src/watch-status.ts` | Long-running event stream subscriber |
+| `src/watch-status.ts` | Long-running event stream subscriber via `oc.rawEvents()` |
+
+### Why we use the SDK and the raw transport together
+
+The SDK's `OpenClaw` class only exposes namespaces for `agents`, `models`, `sessions`, `runs`, `tasks`, `tools`, `artifacts`, `approvals`, `environments`. There's no `config` or `channels` namespace, and no public `rawRequest` method. But `GatewayClientTransport` (the underlying WS transport) **is** publicly exported and has `transport.request(method, params)` — which is exactly the escape hatch we need.
+
+So the pattern is:
+
+```typescript
+import { OpenClaw, GatewayClientTransport } from "@openclaw/sdk";
+
+const transport = new GatewayClientTransport({ url, token });
+const oc = new OpenClaw({ transport });
+await oc.connect();
+
+// Typed namespace where the SDK has it:
+await oc.models.list({ view: "configured" });
+await oc.agents.create({ name: "work", workspace: "..." });
+
+// Raw transport for everything else:
+await transport.request("config.patch", { raw, baseHash });
+await transport.request("channels.start", { channel: "telegram" });
+```
+
+When the SDK adds `oc.config` and `oc.channels` namespaces, the migration is mechanical — replace `transport.request("config.patch", ...)` with `oc.config.patch(...)`. The transport stays as a transport.
 
 ---
 
@@ -38,8 +63,8 @@ flowchart LR
 
     subgraph SIDE["Sidecar container<br/>(node:24-bookworm-slim)"]
         BSTS["src/bootstrap.ts<br/>(orchestrator)"]
-        CL["src/client.ts<br/>(WS client)"]
-        WS["ws npm package"]
+        SDK["@openclaw/sdk<br/>OpenClaw + namespaces"]
+        TRANS["GatewayClientTransport<br/>(raw WS escape hatch)"]
     end
 
     subgraph GW["openclaw container"]
@@ -51,8 +76,10 @@ flowchart LR
 
     SH -->|env| BS
     BS -->|docker run<br/>--network=container:openclaw| SIDE
-    BSTS --> CL --> WS
-    WS ==>|ws:// connect| GWNET
+    BSTS --> SDK
+    BSTS --> TRANS
+    SDK --> TRANS
+    TRANS ==>|ws:// connect| GWNET
     GWNET --> ROUTER
     ROUTER -->|config.patch| STATE
     ROUTER -->|channels.start| CHN

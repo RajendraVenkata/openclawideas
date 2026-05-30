@@ -591,6 +591,69 @@ Always pass `baseUrl` explicitly:
 
 ---
 
+## Issue #7 — Empty-string env var defeats `??` fallback for `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL`
+
+**Date:** 2026-05-30
+**Severity:** Bootstrap-blocking — surfaces as Gateway validation error
+**Status:** Fixed in `src/bootstrap.ts`
+
+### Symptom
+
+`./run-in-sidecar.sh bootstrap` fails on the OpenAI provider patch:
+
+```
+→ config.patch — openai provider + default model
+✗ invalid config: models.providers.openai.baseUrl: Too small: expected string to have >=1 characters
+```
+
+The error is identical to Issue #6 — but the original Issue #6 fix (defaulting `baseUrl` explicitly in bootstrap.ts) had a subtle hole that this issue closes.
+
+### Reproduction
+
+1. Set `OPENAI_API_KEY` on the host.
+2. Do **not** set `OPENAI_BASE_URL` on the host.
+3. Run `./run-in-sidecar.sh bootstrap`.
+
+### Root cause
+
+The sidecar wrapper passes envs through with `:-` shell defaulting:
+
+```bash
+-e OPENAI_BASE_URL="${OPENAI_BASE_URL:-}"
+```
+
+When `OPENAI_BASE_URL` is unset on the host, this becomes `-e OPENAI_BASE_URL=""`. Inside the sidecar, `process.env.OPENAI_BASE_URL` is the **empty string**, not `undefined`.
+
+`bootstrap.ts` then did:
+
+```typescript
+baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+```
+
+`??` only falls back on `null` / `undefined` — **not** empty string. So `baseUrl` resolves to `""`, the patch ships an empty `baseUrl`, and the Gateway's validator rejects it.
+
+### Fix
+
+Use `||` instead of `??` for these env-driven defaults — `||` falls back on any falsy value, including the empty string. Now in `src/bootstrap.ts`:
+
+```typescript
+baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+baseUrl: process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
+```
+
+### Notes
+
+- This is a general gotcha when shell-passed envs interact with `??`. Anywhere a script accepts a `-e FOO="${FOO:-}"` pattern from a wrapper, the consumer needs `||` not `??`.
+- An alternative would be to change the wrapper to omit unset envs entirely (so `process.env.OPENAI_BASE_URL` would be `undefined` inside the sidecar). But that's more complex than just using `||`, and `||` is the right operator semantically here anyway: "use this if it has a meaningful value, otherwise default."
+
+### References
+
+- Bootstrap implementation: `bootstrap/src/bootstrap.ts` — provider config block
+- Companion issue: ISSUES.md #6 (the original baseUrl requirement)
+- Wrapper that introduces the empty-string env: `bootstrap/run-in-sidecar.sh`
+
+---
+
 <!--
 ## Issue template for future entries
 

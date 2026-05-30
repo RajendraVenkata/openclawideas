@@ -1,39 +1,45 @@
 /**
- * Simplest possible smoke test: connect, call `health`, print the result.
+ * Simplest possible smoke test: connect via @openclaw/sdk and call health.
  *
- *   $ npm run health
+ *   $ ./run-in-sidecar.sh health
  *
- * Useful to confirm:
+ * Confirms:
  *   - the container is reachable on OPENCLAW_GATEWAY_URL
  *   - your OPENCLAW_GATEWAY_TOKEN is correct
- *   - the WS handshake works end-to-end
- *
- * If this prints a healthy response, you're good to run `npm run bootstrap`.
+ *   - the WS handshake + SDK transport work end-to-end
  */
 
-import { GatewayClient, readEnv } from "./client.js";
+import { GatewayClientTransport, OpenClaw } from "@openclaw/sdk";
+
+function readEnv(): { url: string; token: string } {
+  const url = process.env.OPENCLAW_GATEWAY_URL ?? "ws://127.0.0.1:18789";
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN;
+  if (!token) throw new Error("OPENCLAW_GATEWAY_TOKEN is not set.");
+  return { url, token };
+}
 
 async function main(): Promise<void> {
   const { url, token } = readEnv();
-  const client = new GatewayClient({ url, token });
+
+  // The SDK exposes namespaces (oc.models, oc.agents, ...) but no raw-RPC
+  // method. We construct the transport ourselves so we can call `health`
+  // (which isn't in any SDK namespace) directly.
+  const transport = new GatewayClientTransport({ url, token });
+  const oc = new OpenClaw({ transport });
 
   console.log(`→ connecting to ${url}`);
-  const hello = await client.connect();
-  console.log("✓ hello-ok");
-  console.log(`  server.version  : ${hello.server.version}`);
-  console.log(`  server.connId   : ${hello.server.connId}`);
-  console.log(`  protocol        : ${hello.protocol}`);
-  console.log(`  negotiated role : ${hello.auth.role}`);
-  console.log(`  negotiated scope: ${hello.auth.scopes.join(", ")}`);
-  console.log(
-    `  policy          : maxPayload=${hello.policy.maxPayload}  tick=${hello.policy.tickIntervalMs}ms`,
-  );
+  await oc.connect();
+  console.log("✓ connected via @openclaw/sdk");
 
   console.log("\n→ rpc: health");
-  const health = await client.rpc("health", {});
+  const health = await transport.request("health", {});
   console.log("✓ health:", JSON.stringify(health, null, 2));
 
-  await client.close();
+  console.log("\n→ rpc: agents.list (via SDK namespace)");
+  const agents = await oc.agents.list();
+  console.log("✓ agents:", JSON.stringify(agents, null, 2));
+
+  await oc.close();
 }
 
 main().catch((err) => {

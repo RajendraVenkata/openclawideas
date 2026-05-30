@@ -198,16 +198,46 @@ If you see those, the Gateway process is alive and accepting traffic. The `/heal
 
 ## Step 6 — Get the bootstrap project
 
-You're reading this file inside `openclawideas/bootstrap/`. From your terminal:
+You're reading this file inside `openclawideas/bootstrap/`. The project depends on `@openclaw/sdk`, which isn't published to npm — it's installed as a `file:` dep from your local OpenClaw repo. So you need to (a) install the OpenClaw monorepo's deps once, (b) build the SDK once, then (c) install the bootstrap project.
+
+### 6a — Install pnpm (once per machine)
+
+The OpenClaw monorepo is pnpm-based:
+
+```bash
+# macOS:
+brew install pnpm
+
+# Or via corepack (bundled with Node):
+corepack enable && corepack prepare pnpm@latest --activate
+
+# Verify
+pnpm --version
+```
+
+### 6b — Install OpenClaw monorepo deps + build the SDK (once)
+
+```bash
+cd /Users/rajendra/projects/openclaw/openclaw
+pnpm install                              # ~1–5 min, pulls down ~1 GB
+cd packages/sdk && pnpm build             # ~2 sec, produces dist/index.mjs
+```
+
+Verify the SDK built:
+
+```bash
+ls /Users/rajendra/projects/openclaw/openclaw/packages/sdk/dist/
+# expect: index.d.mts  index.mjs
+```
+
+### 6c — Install the bootstrap project
 
 ```bash
 cd /Users/rajendra/projects/openclaw/openclawideas/bootstrap
-
-# Install (only need to do this once)
 npm install
 ```
 
-`npm install` brings in `ws`, `tsx`, TypeScript, and types — no other dependencies.
+This pulls in `ws`, `tsx`, TypeScript, and the `@openclaw/sdk` via `file:../../openclaw/packages/sdk`.
 
 ---
 
@@ -521,6 +551,10 @@ The image (`openclaw:local`) sticks around even after `docker rm` so the next ru
 | `UNAVAILABLE` followed by `Config validation failed: <path>` | The path tells you exactly which field is missing/wrong. Read the validator's complaint, fix that key in your patch, retry. |
 | Container exits immediately with `refusing to bind gateway ... without auth` | You're using `--bind lan` without `OPENCLAW_GATEWAY_TOKEN`. Re-read step 4. |
 | Build fails with `ERR_PNPM_STORE_ADD_FAILURE` | See `../ISSUES.md` Issue #1 |
+| `npm install` in bootstrap fails with `ENOENT ../openclaw/packages/sdk` | You skipped step 6b. Build the SDK first: `cd ../../openclaw && pnpm install && cd packages/sdk && pnpm build`. |
+| `tsx: not found` inside the sidecar | First sidecar run hadn't completed `npm install` yet. Retry — the wrapper persists installs in a Docker volume so the second run is fast. |
+| `npm error Missing target in lock file` inside the sidecar | Host's `package-lock.json` records paths the sidecar can't resolve. The wrapper already passes `--no-package-lock` to sidestep this — make sure you're running through `./run-in-sidecar.sh`, not `npm run` directly. |
+| `esbuild` platform mismatch error inside the sidecar | Host installed darwin-arm64 binaries; sidecar needs Linux. The wrapper uses a named Docker volume `openclaw-bootstrap-deps` for the sidecar's node_modules to avoid this. If you see it anyway, `docker volume rm openclaw-bootstrap-deps` and re-run. |
 
 ---
 

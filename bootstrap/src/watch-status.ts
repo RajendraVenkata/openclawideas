@@ -1,51 +1,74 @@
 /**
- * Live event watcher. Subscribes to session + presence events and prints
- * them as they arrive. Use this to confirm channels are wired up:
+ * Live event watcher using @openclaw/sdk's rawEvents async iterator.
  *
- *   $ npm run watch
+ *   $ ./run-in-sidecar.sh watch
  *
- * Then DM the bot from Telegram (or trigger any channel inbound) and
- * you should see `session.message` / `sessions.changed` events appear.
+ * Subscribes to sessions changes via transport.request, then iterates over
+ * oc.rawEvents() to print everything except noisy heartbeats/ticks.
  *
  * Ctrl-C to stop.
  */
 
-import { GatewayClient, readEnv } from "./client.js";
+import { GatewayClientTransport, OpenClaw } from "@openclaw/sdk";
+
+function readEnv(): { url: string; token: string } {
+  const url = process.env.OPENCLAW_GATEWAY_URL ?? "ws://127.0.0.1:18789";
+  const token = process.env.OPENCLAW_GATEWAY_TOKEN;
+  if (!token) throw new Error("OPENCLAW_GATEWAY_TOKEN is not set.");
+  return { url, token };
+}
 
 async function main(): Promise<void> {
   const { url, token } = readEnv();
-  const client = new GatewayClient({ url, token });
+  const transport = new GatewayClientTransport({ url, token });
+  const oc = new OpenClaw({ transport });
 
   console.log(`→ connecting to ${url}`);
-  await client.connect();
+  await oc.connect();
   console.log("✓ connected. watching events. Ctrl-C to stop.\n");
 
-  // Subscribe to all session changes.
-  await client.rpc("sessions.subscribe", {});
+  // Opt in to per-session events.
+  await transport.request("sessions.subscribe", {});
 
   const noisy = new Set(["tick", "heartbeat"]);
 
-  client.onEvent((ev) => {
-    if (noisy.has(ev.event)) return;
-    const ts = new Date().toISOString();
-    const payloadStr = ev.payload
-      ? truncate(JSON.stringify(ev.payload), 600)
-      : "";
-    console.log(
-      `[${ts}] ${ev.event}${ev.seq !== undefined ? ` seq=${ev.seq}` : ""}${
-        payloadStr ? "\n  " + payloadStr : ""
-      }`,
-    );
-  });
+  // Run the event loop in the background while we wait for a signal.
+  const stop = new AbortController();
+  const consumePromise = consumeEvents(oc, noisy, stop.signal);
 
-  // Keep the process alive until Ctrl-C.
   await new Promise<void>((resolve) => {
-    process.on("SIGINT", () => resolve());
-    process.on("SIGTERM", () => resolve());
+    const onSig = () => {
+      stop.abort();
+      resolve();
+    };
+    process.on("SIGINT", onSig);
+    process.on("SIGTERM", onSig);
   });
 
   console.log("\n→ closing");
-  await client.close();
+  await oc.close();
+  await consumePromise.catch(() => {});
+}
+
+async function consumeEvents(
+  oc: OpenClaw,
+  noisy: Set<string>,
+  signal: AbortSignal,
+): Promise<void> {
+  for await (const ev of oc.rawEvents()) {
+    if (signal.aborted) return;
+    const eventName = (ev as { event?: string }).event ?? "(unknown)";
+    if (noisy.has(eventName)) continue;
+    const ts = new Date().toISOString();
+    const payload = (ev as { payload?: unknown }).payload;
+    const seq = (ev as { seq?: number }).seq;
+    const payloadStr = payload ? truncate(JSON.stringify(payload), 600) : "";
+    console.log(
+      `[${ts}] ${eventName}${seq !== undefined ? ` seq=${seq}` : ""}${
+        payloadStr ? "\n  " + payloadStr : ""
+      }`,
+    );
+  }
 }
 
 function truncate(s: string, max: number): string {
