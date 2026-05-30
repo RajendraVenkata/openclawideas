@@ -634,12 +634,253 @@ After a successful bootstrap, `cat ~/openclaw-docker/state/openclaw.json` shows 
 
 The layers map to where you'd start debugging:
 - **Transport** issues: check container, network, token.
-- **Protocol** issues: re-read the connect frame in `client.ts`.
+- **Protocol** issues: re-read the connect frame in the SDK's `GatewayClientTransport`.
 - **Orchestration** issues: check the patch shape against the validator's complaint.
 
 ---
 
-## 12. Source map
+## 12. Scaling out — multi-tenant, Caddy, custom mediator
+
+The single-container, single-token shape that the rest of this doc describes is the **dev / SaaS-provisioning** topology. The production shape for a multi-tenant deployment looks different. This section sketches it as a forward plan; nothing here is implemented in the bootstrap project today.
+
+### 12.1 Target topology
+
+```mermaid
+flowchart TB
+    subgraph CLIENTS["Internet"]
+        BR["Browsers / mobile / API clients"]
+    end
+
+    subgraph EDGE["Edge (TLS termination)"]
+        CD["Caddy<br/>:443 wss + :80 http→https<br/>wildcard cert via DNS challenge"]
+    end
+
+    subgraph APP["docker network: openclaw-app"]
+        MED["TSX mediator<br/>(WS server toward Caddy +<br/>WS client toward gateways)"]
+        OC1["openclaw-tenant-a<br/>:18789 internal only"]
+        OC2["openclaw-tenant-b<br/>:18789 internal only"]
+        OC3["openclaw-tenant-c<br/>:18789 internal only"]
+        REG[("tenant registry<br/>id → token, container name")]
+    end
+
+    BR -->|wss://*.app.example.com| CD
+    CD -->|ws://mediator:8080| MED
+    MED -->|ws://openclaw-tenant-a:18789| OC1
+    MED -->|ws://openclaw-tenant-b:18789| OC2
+    MED -->|ws://openclaw-tenant-c:18789| OC3
+    MED -.reads.-> REG
+```
+
+The relationship to the dev topology:
+
+| Thing | Dev (today) | Multi-tenant (target) |
+|---|---|---|
+| Public exposure | None — loopback only | Caddy on `:443` with wildcard TLS |
+| Reach to gateway | `--network=container:openclaw` (share namespace) | User-defined bridge `openclaw-app` with DNS-by-name |
+| Number of gateways | 1 (`openclaw`) | N (`openclaw-tenant-<id>`) |
+| Who authenticates clients | Static `OPENCLAW_GATEWAY_TOKEN` | Mediator validates JWT/cookie/API key, then attaches the tenant's token upstream |
+| What the client speaks | OpenClaw WS protocol directly | Either OpenClaw (transparent passthrough) or a custom API the mediator translates |
+
+### 12.2 Design forks to settle first
+
+These shape every concrete change downstream:
+
+1. **Transparent vs opinionated mediator.**
+   - *Transparent* — byte-forwards WS frames. Clients authenticate directly with each gateway using its token. Mediator just routes.
+   - *Opinionated* — clients authenticate with the mediator using your own scheme. Mediator decides tenant and connects upstream with the gateway's token. Clients never see the OpenClaw protocol.
+   - For SaaS, **opinionated** is what you usually want.
+
+2. **How to identify a tenant.**
+   - Hostname (`tenant-a.app.example.com`) — needs wildcard cert.
+   - Path (`/t/tenant-a/...`) — simpler TLS, leaks tenant in URL.
+   - JWT claim — invisible from URL, best for end-user routing.
+
+3. **How tenants are provisioned.**
+   - Manual `docker run` per tenant — simplest.
+   - Programmatic via Docker socket from an admin service — the SaaS endgame.
+
+4. **How the mediator authenticates upstream.**
+   - Shared-secret token per tenant (the current `OPENCLAW_GATEWAY_TOKEN` pattern, just one per gateway). Smallest change.
+   - Real device pairing with persisted `deviceToken` per tenant. Production-grade; ~150 lines of careful crypto code (see ISSUES.md #4 for the gap this closes).
+
+### 12.3 Changes per component
+
+#### a. OpenClaw containers (one per tenant)
+
+- **No more `-p 127.0.0.1:18789:18789`.** Containers are only reachable on the internal docker bridge.
+- **Join `openclaw-app` user-defined network.** Containers find each other by name (`openclaw-tenant-a`, etc.) via docker's built-in DNS.
+- **Per-tenant volumes, tokens, env.**
+
+| Per-tenant | Location |
+|---|---|
+| Container | `openclaw-tenant-<id>` |
+| State | `~/openclaw-tenants/<id>/state/` |
+| Auth-profile-secrets | `~/openclaw-tenants/<id>/auth/` |
+| Token file | `~/openclaw-tenants/<id>/.token` |
+| Workspace | `state/workspace/` (nested mount — see SETUP.md step 3 and ISSUES.md #2) |
+
+- **`--bind lan` still required** because the docker bridge isn't host-loopback, and `--allow-unconfigured` only on first-boot until a default config is seeded.
+
+A `spawn-tenant.sh <id>` helper would: create the volumes, generate a fresh token, register the tenant with the mediator (write to its registry), `docker run` the gateway, and pre-seed `openclaw.json` for first-boot defaults.
+
+#### b. Docker networking
+
+```bash
+docker network create openclaw-app
+```
+
+All gateways, the mediator, and Caddy live on this network. Only Caddy publishes to the host (`:80`, `:443`).
+
+#### c. Caddy
+
+A `Caddyfile` like:
+
+```caddyfile
+{
+    email you@example.com
+}
+
+*.app.example.com {
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+    reverse_proxy mediator:8080 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+
+admin.example.com {
+    tls you@example.com
+    basicauth {
+        admin <bcrypt-hash>
+    }
+    reverse_proxy mediator:8080
+}
+```
+
+Caddy auto-handles WS upgrade via the standard `reverse_proxy`. Wildcard certs need DNS challenge (Cloudflare shown; swap for your DNS).
+
+#### d. The TSX mediator
+
+Rough shape:
+
+```
+mediator/
+├── package.json          # deps: @openclaw/sdk, ws, fastify, jsonwebtoken
+├── tsconfig.json
+├── Dockerfile            # node:24-bookworm-slim base
+└── src/
+    ├── index.ts          # boot, env, server lifecycle
+    ├── routing.ts        # request → tenantId (hostname / path / JWT claim)
+    ├── tenants.ts        # tenantId → { containerName, token, ... }
+    ├── auth.ts           # JWT / session / API key validation
+    ├── ws-proxy.ts       # bidirectional WS forwarding
+    └── admin-http.ts     # spawn / list / stop tenants (optional)
+```
+
+Responsibilities:
+
+| Responsibility | Detail |
+|---|---|
+| WS server | Accepts upgraded connections from Caddy. Each incoming WS = one end-user session. |
+| Auth | Validates JWT / cookie / API key on the upgrade. Rejects unauthorized with 401. |
+| Tenant resolution | From validated identity (or hostname/path), determine target tenant. |
+| Upstream client | Connects to `ws://openclaw-tenant-<id>:18789` via SDK's `GatewayClientTransport` using that tenant's token. |
+| Frame forwarding | Pattern A (byte-for-byte) or Pattern B (your protocol → SDK calls). |
+| Lifecycle | Close upstream when client disconnects; idle timeout; reconnect upstream on drop. |
+| Healthcheck | `GET /healthz` with per-tenant connectivity. |
+| Admin RPCs | If you go programmatic provisioning. |
+
+Two viable forwarder patterns:
+
+**Pattern A — transparent passthrough** (~200 LoC):
+```typescript
+clientWs.on("message", (data) => upstreamWs.send(data));
+upstreamWs.on("message", (data) => clientWs.send(data));
+```
+Client speaks OpenClaw directly. Mediator just routes. Simplest, exposes OpenClaw's protocol to your users.
+
+**Pattern B — your own RPC → SDK calls upstream** (~600 LoC):
+```typescript
+clientWs.on("message", async (data) => {
+  const msg = parseYourProtocol(data);
+  if (msg.type === "ask") {
+    const agent = await oc.agents.get(tenant.agentId);
+    const run = await agent.run({ input: msg.input });
+    for await (const ev of run.events()) clientWs.send(yourFormat(ev));
+  }
+});
+```
+Client speaks your API; mediator translates to OpenClaw SDK calls. Hides OpenClaw entirely. More code, more freedom.
+
+Most SaaS products end up at B because A leaks too much (clients can call `config.patch`, see other tenants' surface).
+
+#### e. Bootstrap project changes
+
+Today the bootstrap targets a single `openclaw` container on `127.0.0.1:18789`. For multi-tenant:
+
+| Today | Tomorrow |
+|---|---|
+| Single `OPENCLAW_GATEWAY_TOKEN` env | Loaded from `~/openclaw-tenants/<id>/.token` per invocation |
+| `--network=container:openclaw` in sidecar | `--network openclaw-app` so the sidecar can reach any gateway by name |
+| `ws://127.0.0.1:18789` | `ws://openclaw-tenant-<id>:18789` |
+| `./run-in-sidecar.sh bootstrap` | `./run-in-sidecar.sh <tenant-id> bootstrap` |
+
+The `--network=container:<gw>` trick from § 3 doesn't compose with multiple gateways. The user-defined bridge with name-based DNS does.
+
+**The scope-clearing issue (Issue #4) needs re-evaluation on this topology.** With a docker bridge connection, neither side is loopback — but we're also no longer crossing the host-to-docker boundary. Test before assuming the existing `dangerouslyDisableDeviceAuth` workaround applies. If it doesn't, this is the strongest motivator for actually implementing device pairing in `client.ts` (or replacing the bootstrap's transport with one that does).
+
+### 12.4 Concrete file layout (small monorepo)
+
+```
+openclaw-saas/
+├── docker-compose.yml          # caddy + mediator + tenants
+├── Caddyfile
+├── tenants/
+│   ├── tenant-a/
+│   │   ├── state/              # bind-mounted into openclaw-tenant-a
+│   │   ├── auth/               # auth-profile-secrets
+│   │   └── .token
+│   └── tenant-b/...
+├── mediator/
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── src/...
+├── bootstrap/                  # this project, refactored to accept tenant id
+│   └── run-in-sidecar.sh
+└── scripts/
+    ├── spawn-tenant.sh
+    ├── stop-tenant.sh
+    └── list-tenants.sh
+```
+
+### 12.5 Migration order
+
+1. **One tenant on the new network model.** Tear down the existing single `openclaw` container, recreate it as `openclaw-tenant-a` on `openclaw-app` network with no port mapping. Adapt the bootstrap wrapper to use `--network openclaw-app` and `ws://openclaw-tenant-a:18789`. Verify scopes are not cleared — if they are, decide device pairing now vs `dangerouslyDisableDeviceAuth` first.
+2. **Caddy in front, no mediator yet.** Caddy reverse-proxies directly to that one gateway. This tests TLS + WS upgrade in isolation.
+3. **Mediator as transparent passthrough (Pattern A).** Now you have Caddy → mediator → gateway, with the mediator doing nothing useful yet. This tests the WS chain holds.
+4. **Add real auth + tenant routing to the mediator.** JWT or whatever you picked at design fork #2.
+5. **Spawn second + third tenants.** Exercise the routing path with real isolation between tenants.
+6. **Upgrade mediator to opinionated (Pattern B)** once your API surface stabilizes.
+
+### 12.6 Open questions before writing code
+
+1. Auth scheme for end users — JWT? Session cookies? API keys? Off-the-shelf (Auth0, Clerk, WorkOS)?
+2. Tenant identity in URL — subdomain, path, or JWT-only?
+3. Curated API surface or full OpenClaw surface? — drives Pattern A vs B.
+4. Tenant provisioning — manual ops, admin UI, public signup?
+5. What does data isolation mean? — separate containers is strong, but disk volumes, secrets, network policy all need attention.
+6. Deployment target — single VM, k8s, multi-host? At >5 tenants single-VM gets tight.
+
+When these are settled, fill in the mediator skeleton and the spawn script.
+
+---
+
+## 13. Source map
 
 ```
 bootstrap/
