@@ -231,39 +231,23 @@ You should see JSON listing your available models. If you get `401 Unauthorized`
 
 ---
 
-## Step 7.5 — Seed the device-auth override
+## Step 7.5 — Important: why we run bootstrap as a sidecar container
 
-The bootstrap script connects from your Mac through Docker's port-forwarder. From inside the container, that connection arrives on the Docker bridge interface — **not loopback** — so the "trusted same-process backend client" exception doesn't apply. The Gateway clears your declared scopes to `[]` and scope-gated RPCs fail with `missing scope: operator.read`.
+Before running any WS script, you need to know **why we don't just `npm run` it on the Mac**.
 
-The documented escape hatch is `gateway.controlUi.dangerouslyDisableDeviceAuth: true`. It preserves declared scopes for device-less operator connections.
+The Gateway has a security rule: a WS connection without a paired device identity gets its declared scopes cleared to `[]` unless it qualifies for one of four "trusted" exceptions documented in `docs/gateway/protocol.md`. The exception relevant to us is:
 
-> **Tradeoff:** anyone with your `OPENCLAW_GATEWAY_TOKEN` gets full operator scope. Since the container is bound to `127.0.0.1` and your token lives only on your Mac, the practical exposure is no worse than a leaked API key. For production deployments with non-loopback bind, use real device pairing instead — see `../openclaw-gateway-websocket-setup.md` § Pairing.
+> *"direct-loopback `gateway-client` backend RPCs authenticated with the shared gateway token/password."*
 
-Always write this file from **inside the container** to avoid host-side permission issues (especially on macOS where Docker Desktop's uid translation can fight you):
+Keyword: **direct-loopback**. From inside your Docker container, a connection coming from your Mac through `-p 127.0.0.1:18789` arrives on the Docker bridge interface, **not** the container's own `127.0.0.1`. The exception doesn't fire. You get a successful `hello-ok` but every scope-gated RPC fails with `missing scope: operator.read`.
 
-```bash
-docker exec -i openclaw sh -c 'cat > /home/node/.openclaw/openclaw.json' <<'EOF'
-{
-  "gateway": {
-    "controlUi": {
-      "dangerouslyDisableDeviceAuth": true
-    }
-  }
-}
-EOF
+The fix that mirrors what OpenClaw's own `docker-compose.yml` does (its `openclaw-cli` sidecar uses `network_mode: "service:openclaw-gateway"`): **run the bootstrap from a Node sidecar container that shares the gateway container's network namespace**. From the gateway's perspective, the connection arrives on its own `127.0.0.1` — real loopback. Scopes are preserved.
 
-# Verify it landed
-docker exec openclaw cat /home/node/.openclaw/openclaw.json
+This project ships `run-in-sidecar.sh` to wrap the long `docker run --network=container:openclaw …` command. You'll use it for every npm script from this point on.
 
-# Restart so the Gateway picks up the new config on startup
-docker restart openclaw
+The first call pulls `node:24-bookworm-slim` (~50MB), so it takes ~30 seconds; later calls reuse the cached image.
 
-# Confirm it's healthy
-sleep 5
-curl -fsS http://127.0.0.1:18789/healthz
-```
-
-If you get `sh: cannot create ...: Permission denied`, your host directory perms are blocking the bind-mounted write. Fix with `sudo chmod -R 777 ~/openclaw-docker` and retry.
+> **Configuration also has optimistic concurrency control:** `config.patch` requires a `baseHash` that proves you're patching against the current state. The bootstrap script handles this automatically by calling `config.get` before each patch (see the `configPatch` helper in `src/bootstrap.ts`). If you write your own scripts that call `config.patch`, use the same pattern.
 
 ---
 
@@ -329,12 +313,12 @@ echo "OPENAI key prefix: ${OPENAI_API_KEY:0:7}"  # bash; should print "sk-..."
 
 ---
 
-## Step 10 — Smoke test: `npm run health`
+## Step 10 — Smoke test: `./run-in-sidecar.sh health`
 
-This is the simplest possible WS round-trip. It connects, completes the handshake, calls `health`, and exits.
+This is the simplest possible WS round-trip. It connects via the sidecar, completes the handshake, calls `health`, and exits.
 
 ```bash
-npm run health
+./run-in-sidecar.sh health
 ```
 
 Expected output:
@@ -353,18 +337,20 @@ Expected output:
 ✓ health: { ... }
 ```
 
-If you got this, your Gateway is reachable, your token is right, and the WS handshake is working. You're ready to configure it.
+If you got this, your Gateway is reachable, your token is right, the WS handshake is working, and **the scopes negotiated correctly** (non-empty `negotiated scope` line — confirming the sidecar pattern gave us real loopback). You're ready to configure it.
 
 If you got `Gateway error: AUTH_TOKEN_MISMATCH` → check `OPENCLAW_GATEWAY_TOKEN` matches the one you passed to `docker run` exactly (no trailing newline). Re-read it: `cat ~/.openclaw-secrets/gateway-token`.
+
+If `negotiated scope:` is empty → the sidecar lost the loopback exception. Check that the gateway container's name is exactly `openclaw` (the script defaults to that — override with `OPENCLAW_GATEWAY_CONTAINER=<name>` if you used a different name in `docker run --name`).
 
 If you got `timeout waiting for connect.challenge` → the container isn't reachable. Check `curl http://127.0.0.1:18789/healthz`. If that fails too, check `docker ps` and the container logs (`docker logs openclaw`).
 
 ---
 
-## Step 11 — Configure the Gateway: `npm run bootstrap`
+## Step 11 — Configure the Gateway: `./run-in-sidecar.sh bootstrap`
 
 ```bash
-npm run bootstrap
+./run-in-sidecar.sh bootstrap
 ```
 
 This walks through:
@@ -530,6 +516,9 @@ The image (`openclaw:local`) sticks around even after `docker rm` so the next ru
 | `PAIRING_REQUIRED` from any script | You're not on loopback. SSH-tunnel: `ssh -L 18789:127.0.0.1:18789 user@host` |
 | `models.authStatus` shows `openai: { status: "error" }` | Bad OpenAI key, or OpenAI's API is down. Re-test with the `curl` command from step 7. |
 | `INVALID_REQUEST` on `config.patch` | `raw` isn't a string. Always `JSON.stringify(...)`. The schema is in `src/gateway/protocol/schema/config.ts`. |
+| `config.patch` returns `config base hash required; re-run config.get and retry` | Optimistic concurrency control. Call `config.get` first, pass `baseHash` from the response. `bootstrap.ts` already does this via `configPatch()` — if you're writing your own script, use the same helper. See ISSUES.md #5. |
+| `config.patch` returns `models.providers.openai.baseUrl: Too small` | The Gateway validates baseUrl as required min-length-1 when a provider entry exists. Bootstrap sends explicit defaults; if you have a custom config, ensure every declared provider has a `baseUrl`. See ISSUES.md #6. |
+| `UNAVAILABLE` followed by `Config validation failed: <path>` | The path tells you exactly which field is missing/wrong. Read the validator's complaint, fix that key in your patch, retry. |
 | Container exits immediately with `refusing to bind gateway ... without auth` | You're using `--bind lan` without `OPENCLAW_GATEWAY_TOKEN`. Re-read step 4. |
 | Build fails with `ERR_PNPM_STORE_ADD_FAILURE` | See `../ISSUES.md` Issue #1 |
 

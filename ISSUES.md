@@ -268,6 +268,329 @@ docker run -d --name openclaw \
 
 ---
 
+## Issue #3 — macOS `chown -R 1000:1000` on bind-mount dir locks out both host AND container
+
+**Date:** 2026-05-30
+**Severity:** Runtime — blocks any file write into the bind-mounted state directory
+**Status:** Workaround documented; SETUP.md fixed; not a code bug — host/container uid mismatch
+
+### Symptom
+
+After running `sudo chown -R 1000:1000 ~/openclaw-docker` on macOS as previously suggested in step 3 of SETUP.md, any attempt to write to the state directory fails with `Permission denied`:
+
+**From the host shell:**
+```
+$ cat > ~/openclaw-docker/state/openclaw.json <<'EOF'
+> ...
+> EOF
+zsh: permission denied: /Users/rajendra/openclaw-docker/state/openclaw.json
+```
+
+**From inside the container, even as the `node` user (uid 1000):**
+```
+$ docker exec -i openclaw sh -c 'cat > /home/node/.openclaw/openclaw.json' <<'EOF'
+> ...
+> EOF
+sh: 1: cannot create /home/node/.openclaw/openclaw.json: Permission denied
+```
+
+Same root cause for both: neither side can write to the bind-mounted directory.
+
+### Reproduction
+
+```bash
+mkdir -p ~/openclaw-docker/state/workspace
+sudo chown -R 1000:1000 ~/openclaw-docker      # this is the trap on macOS
+
+docker run ... -v ~/openclaw-docker/state:/home/node/.openclaw ... openclaw:local ...
+
+# Now neither the Mac user (uid 501) nor the container's node (uid 1000) can write.
+```
+
+### Root cause
+
+The chown sets the host filesystem ownership to uid 1000 — a uid that has no corresponding user on macOS. Docker Desktop on Mac translates host ownership into the container's namespace via virtiofs, but the translation expects host ownership to belong to the **Docker Desktop user** (which maps to your Mac uid, typically 501), not to a manually-set Linux uid.
+
+After the chown:
+
+- The **Mac host user** (uid 501) is no longer the owner → `permission denied` on host writes.
+- The **container's `node` user** (uid 1000) sees the directory as owned by something virtiofs reports as uid 1000-but-with-no-write-permission-from-this-namespace → `permission denied` on in-container writes.
+
+On native Linux, this chown is **correct and necessary** — host uid 1000 directly matches the container's `node` user. The bug was assuming the same instruction worked cross-platform.
+
+### Fix priority
+
+#### 1. Quick recovery — `sudo chmod -R 777` and seed config via `docker exec` — recommended
+
+This is the fastest path back to a working state without recreating directories or restarting the container:
+
+```bash
+sudo chmod -R 777 ~/openclaw-docker
+
+docker exec -i openclaw sh -c 'cat > /home/node/.openclaw/openclaw.json' <<'EOF'
+{
+  "gateway": {
+    "controlUi": {
+      "dangerouslyDisableDeviceAuth": true
+    }
+  }
+}
+EOF
+
+docker exec openclaw cat /home/node/.openclaw/openclaw.json   # verify
+docker restart openclaw
+sleep 5
+curl -fsS http://127.0.0.1:18789/healthz
+```
+
+The `chmod 777` is a security downgrade locally but the directory is in your home, not exposed anywhere — same threat model as your `.ssh` directory minus the mode 700.
+
+#### 2. Clean recovery — revert the chown then rely on Docker Desktop's translation
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" ~/openclaw-docker
+docker restart openclaw
+```
+
+Docker Desktop translates your Mac uid → the container's `node` user automatically when host ownership belongs to you. After this, both sides can write again.
+
+#### 3. Full reset — nuke and start over
+
+If perms are too scrambled to untangle:
+
+```bash
+docker rm -f openclaw
+sudo rm -rf ~/openclaw-docker
+mkdir -p ~/openclaw-docker/state/workspace
+mkdir -p ~/openclaw-docker/auth-profile-secrets
+# DO NOT chown on macOS — Docker Desktop handles uid mapping for you
+# Re-run docker run from SETUP.md step 4
+```
+
+### Notes
+
+- **Linux users:** the chown to uid 1000 is the right thing — keep doing it. The container's `node` user shares uid 1000 with the host namespace directly, no translation layer.
+- **macOS users:** skip the chown entirely. Docker Desktop's virtiofs handles the uid mapping. Your `.openclaw` dir should stay owned by your Mac user.
+- Don't try to "fix" this by `chown -R node` inside the container — `node` is uid 1000 in the container and that's what the host already has. The problem is the translation layer expecting the host owner to be your Mac uid.
+- The Dockerfile pre-creates `/home/node/.openclaw` with mode `0700` owned by `node:node` (Dockerfile:293–301). Bind mounts shadow those perms with whatever the host directory has.
+
+### References
+
+- SETUP.md step 3 (updated): platform-aware chown instructions
+- SETUP.md step 7.5 (added): seed config files via `docker exec` (avoids host-perm issues regardless of platform)
+- SETUP.md troubleshooting table (updated): rows for both `zsh: permission denied` and `sh: cannot create ...` symptoms
+- Companion: `openclaw-docker-build-and-run.md` § 14 (Common build/run failures)
+- Docker Desktop uid translation: <https://docs.docker.com/desktop/settings/mac/#file-sharing>
+
+---
+
+## Issue #4 — WS scopes cleared to `[]` when bootstrap runs from outside Docker container's network namespace
+
+**Date:** 2026-05-30
+**Severity:** Runtime — blocks every scope-gated RPC after a successful handshake
+**Status:** Workaround documented (sidecar pattern); ships as `run-in-sidecar.sh`
+
+### Symptom
+
+`hello-ok` succeeds but `negotiated scope:` is empty. Then every scope-gated RPC fails:
+
+```
+→ connecting to ws://127.0.0.1:18789
+✓ connected to OpenClaw 2026.5.26
+  scopes negotiated:           <-- EMPTY
+
+→ health                       <-- works (unscoped)
+✓ { ... }
+
+→ models.list (state-before)
+✗ Gateway error: {"code":"INVALID_REQUEST","message":"missing scope: operator.read"}
+```
+
+### Reproduction
+
+1. Run OpenClaw gateway in Docker with `-p 127.0.0.1:18789:18789` (bridge networking).
+2. Run any WS client from the host with `client.id: "gateway-client"` + `client.mode: "backend"` + no device identity, presenting the shared token.
+
+### Root cause
+
+From `docs/gateway/protocol.md`:
+
+> *"WS clients normally include `device` identity during `connect` (operator + node). The only device-less operator exceptions are explicit trust paths: ... direct-loopback `gateway-client` backend RPCs authenticated with the shared gateway token/password."*
+
+Keyword: **direct-loopback**. From inside the gateway container, connections from the host through `-p 127.0.0.1:18789` arrive on the Docker bridge interface (e.g. `172.17.0.1`), not on the container's own `127.0.0.1`. The exception doesn't fire. The Gateway runs `shouldClearUnboundScopesForMissingDeviceIdentity` and reduces declared scopes to `[]`.
+
+`gateway.controlUi.dangerouslyDisableDeviceAuth: true` did **not** restore scopes in testing — that key may only apply to Control UI HTTP origins, not arbitrary backend WS connects.
+
+### Fix priority
+
+#### 1. Run scripts in a sidecar container that shares the gateway's network namespace — recommended
+
+Mirrors the OpenClaw `docker-compose.yml` pattern (the `openclaw-cli` service uses `network_mode: "service:openclaw-gateway"`).
+
+```bash
+docker run --rm \
+  --network=container:openclaw \
+  -v "$(pwd)":/work -w /work \
+  -e OPENCLAW_GATEWAY_URL="ws://127.0.0.1:18789" \
+  -e OPENCLAW_GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN" \
+  ... \
+  node:24-bookworm-slim \
+  sh -c 'npm install --silent && npm run bootstrap'
+```
+
+From inside the sidecar, `ws://127.0.0.1:18789` is true loopback from the gateway's POV. The `gateway-client` backend exception fires, scopes preserved.
+
+The bootstrap project ships `run-in-sidecar.sh` to wrap this. Usage: `./run-in-sidecar.sh <script-name>`.
+
+#### 2. Implement real device pairing in the client
+
+The proper long-term answer for production: generate Ed25519 keypair, sign the `connect.challenge` nonce with the v3 payload format (`docs/gateway/protocol.md` "Device identity + pairing"), persist the resulting `deviceToken` from `hello-ok.auth.deviceToken`. The Gateway never clears your scopes after that. Requires ~150 lines of crypto-careful code.
+
+#### 3. SSH-tunnel from a remote host
+
+For non-Docker setups, `ssh -L 18789:127.0.0.1:18789 user@gateway-host`. From your laptop, `ws://127.0.0.1:18789` then tunnels through the SSH connection and arrives on the gateway's actual loopback — exception fires.
+
+### Notes
+
+- The bootstrap project's `run-in-sidecar.sh` first pulls `node:24-bookworm-slim` (~50 MB), so the first run takes ~30 seconds. Subsequent runs reuse the cached image and `node_modules` (mounted from host).
+- The wrapper checks that the gateway container is running before launching the sidecar, so you get a clear error instead of a cryptic `--network=container:...` failure.
+- Watch mode (`./run-in-sidecar.sh watch`) needs interactivity, so the wrapper adds `-it` automatically for that one script.
+
+### References
+
+- `docs/gateway/protocol.md` — device-less exceptions list, `shouldClearUnboundScopesForMissingDeviceIdentity` behavior
+- `docker-compose.yml:96` (service definition for `openclaw-cli`) — the sidecar pattern in the OpenClaw repo
+- `bootstrap/run-in-sidecar.sh` — the wrapper that fixes this
+- `bootstrap/README.md` § "Why the sidecar?" — narrative version of this root cause
+
+---
+
+## Issue #5 — `config.patch` requires `baseHash` even though the schema marks it Optional
+
+**Date:** 2026-05-30
+**Severity:** Runtime — blocks every config write after the first one
+**Status:** Workaround in `bootstrap.ts` via `configPatch()` helper
+
+### Symptom
+
+```
+→ config.patch — openai + anthropic provider + default model
+✗ Gateway error: {"code":"INVALID_REQUEST","message":"config base hash required; re-run config.get and retry"}
+```
+
+### Reproduction
+
+Call `config.patch` with only `raw`:
+
+```typescript
+await client.rpc("config.patch", { raw: JSON.stringify(patch) });
+```
+
+### Root cause
+
+`src/gateway/protocol/schema/config.ts` declares `baseHash` as `Type.Optional(NonEmptyString)` in `ConfigPatchParamsSchema`. The runtime gateway, however, **requires** it once an active config exists, as an optimistic-concurrency-control token. This prevents two simultaneous writers from clobbering each other's changes — if your `baseHash` doesn't match the current state, the patch is rejected and you have to re-fetch.
+
+The "Optional" in the schema means callers can omit it; the validator catches the missing value and returns this specific error message telling you to re-fetch.
+
+### Fix
+
+Fetch the current snapshot, extract `hash` (or `baseHash`, depending on Gateway version), include it on every `config.patch` call. After a successful patch the hash changes, so each patch re-fetches.
+
+```typescript
+async function configPatch(
+  client: GatewayClient,
+  patch: Record<string, unknown>,
+): Promise<unknown> {
+  const current = await client.rpc<Record<string, unknown>>("config.get", {});
+  const hash =
+    typeof current["hash"] === "string" ? (current["hash"] as string)
+    : typeof current["baseHash"] === "string" ? (current["baseHash"] as string)
+    : undefined;
+
+  return client.rpc("config.patch", {
+    raw: JSON.stringify(patch),
+    ...(hash ? { baseHash: hash } : {}),
+  });
+}
+```
+
+The bootstrap project's `src/bootstrap.ts` includes this helper and uses it for every config write. The README's "Extending the bootstrap" section warns that any new `config.patch` calls must use it too.
+
+### Notes
+
+- This is **good behavior** — the alternative would be silent lost writes when two scripts race.
+- The field name in the `config.get` response is `hash` in the version I tested (`2026.5.26`). Older or newer versions might use `baseHash`. The helper tries both.
+- `config.apply` and `config.set` use the same `ConfigApplyLikeParamsSchema` shape and the same baseHash requirement.
+
+### References
+
+- Schema: `src/gateway/protocol/schema/config.ts:22–43` (`ConfigSetParamsSchema`, `ConfigApplyLikeParamsSchema`)
+- Bootstrap implementation: `bootstrap/src/bootstrap.ts` — `configPatch()` helper
+- README extension guide: `bootstrap/README.md` § "Two gotchas to know"
+
+---
+
+## Issue #6 — `models.providers.<id>.baseUrl` validated as required min-length-1 string
+
+**Date:** 2026-05-30
+**Severity:** Runtime — blocks declaring a model provider with only `apiKey`
+**Status:** Workaround in `bootstrap.ts` (passes explicit defaults)
+
+### Symptom
+
+```
+→ config.patch — openai provider + default model
+✗ Gateway error: {"code":"UNAVAILABLE","message":"Error: Config validation failed: models.providers.openai.baseUrl: Too small: expected string to have >=1 characters"}
+```
+
+### Reproduction
+
+Patch a provider entry with only `apiKey`:
+
+```typescript
+const patch = {
+  models: {
+    providers: {
+      openai: { apiKey: openaiKey }   // no baseUrl
+    }
+  }
+};
+```
+
+### Root cause
+
+The Gateway version I tested (`2026.5.26`) validates `models.providers.<id>` entries with `baseUrl` as a non-empty string. In examples around the public docs, `baseUrl` is shown as optional — implying it defaults to the provider's canonical endpoint. This Gateway version's validator treats the missing/empty value as a hard error.
+
+### Fix
+
+Always pass `baseUrl` explicitly:
+
+```typescript
+{
+  openai: {
+    apiKey: openaiKey,
+    baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+  },
+  anthropic: {
+    apiKey: anthropicKey,
+    baseUrl: process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
+  },
+}
+```
+
+### Notes
+
+- For Azure OpenAI, vLLM, or any OpenAI-compatible proxy, set `OPENAI_BASE_URL` in your env. The bootstrap honors it.
+- This is also a hint that the docs may be out of date relative to the validator. When the Gateway returns `Config validation failed: <path>: <constraint>`, the path tells you exactly which field needs a value — read it literally.
+
+### References
+
+- Bootstrap implementation: `bootstrap/src/bootstrap.ts` — provider config block
+- `.env.example` — `OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` overrides
+- Public docs that show baseUrl as optional (out of sync with current validator): `docs/providers/openai.md`, `docs/providers/anthropic.md`
+
+---
+
 <!--
 ## Issue template for future entries
 

@@ -2,15 +2,23 @@
 
 Minimal TypeScript sample that configures an **unconfigured** OpenClaw Gateway over WebSocket. Points at a Gateway you've already started (in your case: the Docker container running `--allow-unconfigured` on `127.0.0.1:18789`).
 
-Three runnable scripts:
+Three runnable scripts. Run them through the sidecar wrapper — **not** plain `npm run` (see "Why the sidecar?" below):
 
 | Script | Command | What it does |
 |---|---|---|
-| Health | `npm run health` | Connect, handshake, call `health`. Prints `hello-ok` details. The smoke test. |
-| Bootstrap | `npm run bootstrap` | Connect, snapshot state, apply provider + model + Telegram config, verify. Idempotent. |
-| Watch | `npm run watch` | Subscribe to live events. Lets you see channel inbound traffic as it arrives. |
+| Health | `./run-in-sidecar.sh health` | Connect, handshake, call `health`. Prints `hello-ok` details. The smoke test. |
+| Bootstrap | `./run-in-sidecar.sh bootstrap` | Connect, snapshot state, apply provider + model + Telegram config, verify. Idempotent. Handles `config.get` → `baseHash` → `config.patch` for you. |
+| Watch | `./run-in-sidecar.sh watch` | Subscribe to live events. Lets you see channel inbound traffic as it arrives. |
 
 No `@openclaw/sdk` dep — raw `ws` so the protocol is fully visible. Read `src/client.ts` to see the handshake on the wire.
+
+### Why the sidecar?
+
+The Gateway clears all declared scopes to `[]` for any WS connection that lacks a paired device identity **and** doesn't arrive on the gateway's own loopback interface. Connections from your Mac through `docker run -p 127.0.0.1:18789` come in on the Docker bridge — not loopback from the gateway's POV — so plain `npm run health` from the Mac returns `hello-ok` with empty scopes, then every scope-gated RPC fails with `missing scope: operator.read`.
+
+`run-in-sidecar.sh` launches a `node:24-bookworm-slim` container with `--network=container:openclaw`, which shares the gateway's network namespace. Connections from inside the sidecar to `ws://127.0.0.1:18789` are then **real loopback** to the gateway. The `gateway-client backend` exception fires, scopes are preserved, everything works.
+
+This mirrors OpenClaw's own `docker-compose.yml` — its `openclaw-cli` service uses `network_mode: "service:openclaw-gateway"` for the same reason.
 
 ---
 
@@ -138,11 +146,13 @@ bootstrap/
 ├── .env.example
 ├── .gitignore
 ├── README.md
+├── SETUP.md              # From-zero walkthrough (start here for first install)
+├── run-in-sidecar.sh     # Wrapper that runs scripts in a network-shared sidecar
 └── src/
     ├── client.ts         # Reusable WS client + RPC + event subscription
-    ├── health.ts         # Smoke test (npm run health)
-    ├── bootstrap.ts      # Full configuration (npm run bootstrap)
-    └── watch-status.ts   # Live event stream (npm run watch)
+    ├── health.ts         # Smoke test (./run-in-sidecar.sh health)
+    ├── bootstrap.ts      # Full configuration (./run-in-sidecar.sh bootstrap)
+    └── watch-status.ts   # Live event stream (./run-in-sidecar.sh watch)
 ```
 
 ---
@@ -178,7 +188,7 @@ For the SaaS / multi-tenant case the right answer is usually a separate Gateway 
 
 ## Extending the bootstrap
 
-Add new steps to `bootstrap.ts` by copy-pasting the `await step("name", async () => { ... })` pattern.
+Add new steps to `bootstrap.ts` by copy-pasting the `await step("name", async () => { ... })` pattern. **Always use `configPatch(client, {...})` instead of raw `client.rpc("config.patch", ...)`** — it fetches the current hash and includes it as `baseHash`, which the Gateway requires.
 
 The methods you'll most likely want next (all on the same WS surface, all with schemas in `src/gateway/protocol/schema/*.ts`):
 
@@ -193,16 +203,15 @@ await step("agents.create work", async () =>
 );
 
 // Bind a Telegram account to that agent
+//   note: configPatch (not raw rpc) — handles baseHash automatically
 await step("config.patch — binding", async () =>
-  client.rpc("config.patch", {
-    raw: JSON.stringify({
-      bindings: [
-        {
-          agentId: "work",
-          match: { channel: "telegram", accountId: "default" },
-        },
-      ],
-    }),
+  configPatch(client, {
+    bindings: [
+      {
+        agentId: "work",
+        match: { channel: "telegram", accountId: "default" },
+      },
+    ],
   }),
 );
 
@@ -225,6 +234,12 @@ await step("config.schema.lookup channels.msteams", async () =>
 
 For WhatsApp specifically you also need `web.login.start` / `web.login.wait` (QR loop) — see `openclaw-channels-via-websocket.md` § 4 for the exact pattern.
 
+### Two gotchas to know when writing your own `config.patch` calls
+
+1. **`raw` is a JSON5 string.** Always `JSON.stringify(yourPatchObject)`. If you forget, the validator returns `INVALID_REQUEST`.
+2. **`baseHash` is required at runtime** even though the schema marks it optional. Use the `configPatch` helper. The Gateway uses optimistic concurrency to prevent two writers from clobbering each other.
+3. **Provider entries require `baseUrl`.** If you add a new provider in a `config.patch`, include both `apiKey` and `baseUrl` (non-empty string). For OpenAI: `https://api.openai.com/v1`. For Anthropic: `https://api.anthropic.com`. The Gateway's validator fails the patch otherwise.
+
 ---
 
 ## Troubleshooting
@@ -233,8 +248,12 @@ For WhatsApp specifically you also need `web.login.start` / `web.login.wait` (QR
 |---|---|---|
 | `timeout waiting for connect.challenge` | Gateway not reachable, or wrong URL | Check `OPENCLAW_GATEWAY_URL`; `curl http://...18789/healthz` |
 | `Gateway error: AUTH_TOKEN_MISMATCH` | Token doesn't match container's `OPENCLAW_GATEWAY_TOKEN` | Re-read the token you used at `docker run` |
-| `Gateway error: PAIRING_REQUIRED` | Connecting from non-loopback | SSH-tunnel; see "Connecting from a non-loopback host" |
+| `Gateway error: PAIRING_REQUIRED` | Connecting from non-loopback. For Docker: use `./run-in-sidecar.sh`. For SSH/remote: use the tunnel pattern in "Connecting from a non-loopback host". |
 | `WebSocket closed (1008)` | Auth failure | Same as above |
+| `missing scope: operator.read` (after a successful `hello-ok`) | Scopes cleared because connection isn't real loopback. Use `./run-in-sidecar.sh` instead of plain `npm run`. |
+| `scopes negotiated:` line is empty in `npm run health` output | Same as above. |
+| `config base hash required; re-run config.get and retry` on `config.patch` | Optimistic concurrency. Use the `configPatch()` helper from `src/bootstrap.ts` instead of raw `client.rpc("config.patch", ...)` — it auto-fetches the hash. |
+| `Config validation failed: models.providers.<id>.baseUrl: Too small` | Provider entries require `baseUrl` (non-empty string). Bootstrap sends defaults; if you're hand-rolling a patch, add `baseUrl` for every provider. |
 | `Gateway error: UNAVAILABLE` `startup-sidecars` | Container still warming up | Wait a few seconds, retry |
 | `rpc timeout: <method>` | Method handler is slow or container is overloaded | Bump `RPC_TIMEOUT_MS` in `client.ts` |
 | `Gateway error: INVALID_REQUEST` on `config.patch` | `raw` isn't a string | Always `JSON.stringify(...)` — `raw` is a JSON5 string per `src/gateway/protocol/schema/config.ts` |
