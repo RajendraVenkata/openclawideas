@@ -81,7 +81,7 @@ bootstrap.ts  ── calls ──▶  resolveGatewayPort()        (config/paths.
               ── calls ──▶  resolveGatewayAuth()         (gateway/auth-resolve.ts) step 2
               ── calls ──▶  resolveGatewayReloadSettings + startGatewayConfigReloader  step 3
               ── calls ──▶  listenGatewayHttpServer()    (gateway/server/http-listen.ts) step 4
-              ── calls ──▶  loadChannels() + startChannels()  (channels/registry.ts)    step 5
+              ── calls ──▶  startChannels()              (channels/channel-manager.ts)   step 5
 ```
 
 ---
@@ -790,250 +790,292 @@ dance) — that's how **one port serves both HTTP and WebSocket**.
 > that returns the current auth (not the auth value itself). That indirection is
 > deliberate — it always reads the latest `resolvedAuth`, so reloads take effect.
 
-> ℹ️ The real `createBareGatewayHttpServer` also takes a second argument — the channel
-> registry — and serves one extra route (`POST /channels/<id>/inbound`). That part is
-> covered in **Part 9e**, once we've met the channel subsystem.
+> ℹ️ `createBareGatewayHttpServer` also takes a second argument — the channel lookup —
+> and serves one extra route (`POST /channels/<id>/inbound`). That's covered in
+> **Part 9f**, once we've met the channel subsystem.
 
 ---
 
-## Part 9 — Step 5: the channel subsystem (`src/channels/…`)
+## Part 9 — Step 5: the channel subsystem (faithful to real OpenClaw)
 
 A **channel** is a connector to a messaging surface (WhatsApp, Telegram, …). Step 5
-loads the enabled channels, starts them, and routes incoming messages to the agent.
-This is four small files — and it's where you'll meet the last batch of TypeScript:
-`interface`, `class`, and `implements`.
+loads the enabled channel **plugins**, connects their transports, and routes incoming
+messages to the agent. This layer uses the **real OpenClaw names and structure** — a
+plugin SDK, a catalog, and a WhatsApp plugin under `extensions/` — so it spans a few
+more files than the rest of the demo. New TypeScript here: the **open-union trick**,
+**identity factory functions**, **path-alias imports**, and **side-effect imports**.
 
-> ⚠️ **Honesty note:** the real WhatsApp channel uses the **Baileys** library (QR
-> code, encryption, live network). That's not "simple," so here the *transport is
-> simulated* — we keep the real *shape* (start/stop/send + an inbound event) and fake
-> the wire. Everything above the wire mirrors the real product.
+> ⚠️ **Two things are stubbed** (clearly labelled in the files): the **transport**
+> (real WhatsApp uses the **Baileys** library — QR pairing, encryption, live network)
+> and the **agent** (real is the Pi agent loop). Everything *between* them uses the
+> genuine structure.
 
-### 9a. The contract — `src/channels/types.ts`
+The real layout, mirrored:
+
+```
+src/plugin-sdk/channel-core.ts        the SDK: ChannelPlugin + adapters + factories
+src/plugin-sdk/inbound-envelope.ts    routing: channel/peer → { agentId, sessionKey }
+src/channels/plugins/catalog.ts       the plugin registry
+src/channels/channel-manager.ts       starts channels, wires inbound → agent → outbound
+extensions/whatsapp/src/…             the WhatsApp plugin (channel.ts, send.ts, …)
+src/agent/run-agent-stub.ts           the agent stand-in
+```
+
+### 9a. The plugin SDK — `src/plugin-sdk/channel-core.ts`
+
+This file defines the **contract** a channel plugin must fit. The real shape is split
+across several files; we consolidate it. Highlights:
 
 ```ts
-export type InboundMessage = {
-  channel: string;   // "whatsapp"
-  from: string;      // sender id, e.g. a phone number
-  body: string;      // the text the user sent
-  timestamp: number;
+export type ChannelId = "whatsapp" | "telegram" | "slack" | (string & {});
+
+export type ChannelMessageAdapter = {
+  id: ChannelId;
+  capabilities: { text: boolean; replyTo?: boolean };
+  send: { text: (ctx: ChannelMessageSendContext) => Promise<ChannelMessageSendResult> };
 };
 
-export type OutboundMessage = { to: string; text: string };
+export function defineChannelMessageAdapter(adapter: ChannelMessageAdapter): ChannelMessageAdapter {
+  return adapter;
+}
 
-export type ChannelDeps = {
-  processMessage: (msg: InboundMessage) => Promise<string | null>;
+export type ChannelPlugin = {
+  id: ChannelId;
+  meta: ChannelMeta;
+  capabilities: ChannelCapabilities;
+  outbound?: ChannelOutboundAdapter;
+  message?: ChannelMessageAdapter;
+  messaging?: ChannelMessagingAdapter;
+  transport?: ChannelTransport;
 };
 
-export interface Channel {
-  readonly id: string;
-  start(): Promise<void>;
-  stop(): Promise<void>;
-  send(msg: OutboundMessage): Promise<void>;
-  simulateInbound?(from: string, text: string): Promise<string | null>;
+export function createChatChannelPlugin(input: ChannelPlugin): ChannelPlugin {
+  return input;
 }
 ```
 
-**What it does:** defines the *shape every channel must have*. `InboundMessage`/
-`OutboundMessage` are the envelopes that flow in and out; `ChannelDeps` is what the
-gateway hands each channel (just a `processMessage` function — the agent). `Channel`
-is the interface a channel class must satisfy.
+> 📘 **TS — the open-union trick `(string & {})`.** `ChannelId` is `"whatsapp" |
+> "telegram" | "slack" | (string & {})`. The literals give you **autocomplete** for the
+> known channels, while `(string & {})` quietly allows *any* string too. (Plain
+> `string` alone would erase the autocomplete; `string & {}` is a TypeScript quirk that
+> keeps the literal suggestions while still accepting all strings.) This is copied from
+> the real codebase.
 
-> 📘 **TS — `interface` vs `type`.** You've seen `type X = {…}`. `interface X {…}` is
-> the other way to describe an object shape. For plain object shapes they're almost
-> interchangeable, but `interface` is the conventional choice for "a contract a
-> **class** will implement" (which is exactly our case). Rule of thumb: `type` for
-> data shapes and unions; `interface` for "things with methods that classes
-> implement."
+> 📘 **TS — identity "define/create" factory functions.** `defineChannelMessageAdapter`
+> and `createChatChannelPlugin` just **return their argument** — at runtime they do
+> nothing. Their value is purely at *compile time*: by typing the parameter as
+> `ChannelMessageAdapter` / `ChannelPlugin`, they make the editor **check the object
+> you pass and autocomplete its fields right there**. This "identity function for
+> type-checking + autocomplete" is a very common SDK pattern (think `defineConfig` in
+> many tools). The real SDK versions also brand/validate, but the idea is the same.
 
-> 📘 **TS — method signatures in an interface.** `start(): Promise<void>` inside the
-> interface means "any Channel must have a `start` method that takes nothing and
-> returns a `Promise<void>`." It declares the *signature* only — no body. The class
-> supplies the body.
+> 📘 **TS — `type ChannelPlugin = { … }` with optional adapter fields.** Note the real
+> contract is a **`type`** (object type), and most fields are optional (`outbound?`,
+> `message?`, `transport?`). A plugin supplies only the adapters it needs. (Earlier we
+> contrasted `type` vs `interface`; OpenClaw uses `type` here because a plugin is a
+> data object assembled by a factory, not a class.)
 
-> 📘 **TS — `readonly id: string`.** `readonly` means once set, the field can't be
-> reassigned. A channel's `id` ("whatsapp") never changes, so this documents and
-> enforces that.
+### 9b. Routing — `src/plugin-sdk/inbound-envelope.ts`
 
-> 📘 **TS — the optional method `simulateInbound?(…)`.** The `?` makes the whole
-> method optional — a channel *may* provide it. That's why the HTTP route later writes
-> `channel?.simulateInbound` and checks it exists before calling. (Our WhatsApp class
-> provides it; a real channel wouldn't — its messages come from the live transport.)
-
-### 9b. The agent stand-in — `src/channels/agent-stub.ts`
+Before the agent runs, an inbound message is **routed** to an agent + session, then
+**formatted** into the text the agent sees.
 
 ```ts
-export async function processMessage(msg: InboundMessage): Promise<string | null> {
-  const text = msg.body.trim();
-  if (!text) return null;
-  return `🤖 (echo agent) you said: "${text}" — ${text.length} chars`;
+export function resolveInboundRoute(params: {
+  cfg: OpenClawConfig; channel: ChannelId; accountId: string; peer: RoutePeer;
+}): Route {
+  const agentId = "main";
+  const sessionKey =
+    params.peer.kind === "direct"
+      ? `agent:${agentId}:main`
+      : `agent:${agentId}:${params.channel}:${params.peer.kind}:${params.peer.id}`;
+  return { agentId, sessionKey };
 }
 ```
 
-**What it does:** the *entire* real agent loop (model + tools, hundreds of files) is
-replaced by this echo so you can watch the plumbing. Given an inbound message, it
-returns reply text (or `null` for "nothing to say").
+**What it does:** maps `(channel, peer)` → `{ agentId, sessionKey }`. A direct message
+goes to the main session; a group/channel gets its own session key. The real resolver
+walks the most-specific binding; we use the common default-agent case.
 
-> 📘 **TS — `Promise<string | null>`.** The return is "a promise of *either* a string
-> *or* null." Callers must handle the `null` case — which the channel does with
-> `if (reply) …`.
+> 📘 **JS — building the session key with a template literal.** `` `agent:${agentId}:${params.channel}:…` `` —
+> the same `${…}` interpolation you saw before, here used to compute a routing key.
 
-### 9c. The WhatsApp channel — `src/channels/whatsapp/channel.ts`
-
-This is the first **class** that implements our interface.
+### 9c. The catalog — `src/channels/plugins/catalog.ts`
 
 ```ts
-export class WhatsAppChannel implements Channel {
-  readonly id = "whatsapp";
+const registry = new Map<ChannelId, ChannelPlugin>();
 
-  constructor(
-    private readonly config: WhatsAppChannelConfig,
-    private readonly deps: ChannelDeps,
-  ) {}
+export function registerChannelPlugin(plugin: ChannelPlugin): void {
+  registry.set(plugin.id, plugin);
+}
 
-  async start(): Promise<void> { /* REAL: makeWASocket(), print QR, pair… */ }
-  async stop(): Promise<void> { /* REAL: sock.logout() */ }
-
-  async send(msg: OutboundMessage): Promise<void> {
-    // REAL: await sock.sendMessage(jid, { text: msg.text })
-    console.log(`📤 [whatsapp → ${msg.to}] ${msg.text}`);
+export function getEnabledChannelPlugins(cfg: OpenClawConfig): ChannelPlugin[] {
+  const channels: ChannelsConfig = cfg.channels ?? {};
+  const enabled: ChannelPlugin[] = [];
+  for (const plugin of registry.values()) {
+    const channelCfg = channels[plugin.id as keyof ChannelsConfig];
+    if (channelCfg?.enabled) enabled.push(plugin);
   }
-
-  async simulateInbound(from: string, text: string): Promise<string | null> {
-    const msg: InboundMessage = { channel: this.id, from, body: text, timestamp: Date.now() };
-    console.log(`📥 [whatsapp ← ${from}] ${text}`);
-    const reply = await this.deps.processMessage(msg);  // ingress → agent
-    if (reply) await this.send({ to: from, text: reply }); // → egress
-    return reply;
-  }
+  return enabled;
 }
 ```
 
-**What it does:** on `simulateInbound` (which stands in for the transport's "message
-arrived" event), it builds an `InboundMessage`, hands it to `processMessage` (the
-agent), and sends the reply back out via `send`. That's the whole **ingress → agent
-→ egress** loop in one method.
+**What it does:** keeps a **module-level registry** of every plugin that registered
+itself, and returns the ones enabled in config. The real catalog tracks all bundled +
+external channel plugins the same way.
 
-> 📘 **TS — `class … implements Channel`.** `implements` tells TS "this class must
-> satisfy the `Channel` interface." If you forgot `stop()`, or typed `send` to return
-> the wrong thing, TS would error: *"Class 'WhatsAppChannel' incorrectly implements
-> interface 'Channel'."* The interface is a checklist the compiler enforces.
+> 📘 **JS/TS — a module-level singleton.** `const registry = new Map(...)` at the top of
+> the file exists **once** for the whole program (modules are evaluated once and
+> cached). Plugins call `registerChannelPlugin(...)` to add themselves to that one
+> shared map. This is how plugin systems "discover" plugins without the core importing
+> each one directly.
 
-> 📘 **TS — parameter properties `private readonly config`.** Remember this shortcut
-> from `GatewayLockError`? In the constructor, `private readonly config: WhatsAppChannelConfig`
-> **declares the field, marks it private + read-only, and assigns it** — all at once.
-> No `this.config = config` needed. `private` means only code inside this class can
-> read it; `readonly` means it can't be reassigned after construction.
+> 📘 **TS — `keyof` + indexed lookup.** `channels[plugin.id as keyof ChannelsConfig]`.
+> `keyof ChannelsConfig` is the union of that type's keys (here `"whatsapp"`). The `as`
+> tells TS "treat this id as one of those keys" so the index is allowed. The result is
+> `WhatsAppChannelConfig | undefined` — hence the `channelCfg?.enabled` check.
 
-> 📘 **TS — `readonly id = "whatsapp"`.** A class field with an initial value. Because
-> the interface said `readonly id: string`, this satisfies it. TS infers its type as
-> `string` from the value.
+### 9d. The WhatsApp plugin — `extensions/whatsapp/src/…`
 
-> 📘 **TS — `async` methods.** `async start()` is a method that returns a Promise —
-> same rules as `async function`. The interface declared `start(): Promise<void>`, and
-> an `async` method returning nothing matches `Promise<void>`.
-
-> 📘 **JS — `this`.** Inside the class, `this.id`, `this.deps`, `this.send(...)` refer
-> to the current instance. `this.deps.processMessage(...)` calls the function the
-> gateway injected when it built this channel.
-
-### 9d. The registry — `src/channels/registry.ts`
+The plugin is split exactly like the real one. The **leaf send** (`send.ts`):
 
 ```ts
-export function loadChannels(cfg: OpenClawConfig, deps: ChannelDeps): Channel[] {
-  const channels: Channel[] = [];
-  if (cfg.channels?.whatsapp?.enabled) {
-    channels.push(new WhatsAppChannel(cfg.channels.whatsapp, deps));
-    console.log("[gateway] channel registered: whatsapp");
-  }
-  return channels;
-}
-
-export async function startChannels(channels: Channel[]): Promise<void> {
-  for (const channel of channels) {
-    await channel.start();
-  }
+export async function sendMessageWhatsApp(to: string, text: string, _options = {}): Promise<{ messageId: string }> {
+  console.log(`📤 [whatsapp → ${to}] ${text}`);          // REAL: await sock.sendMessage(jid, { text })
+  return { messageId: `wamid.SIMULATED.${to}` };
 }
 ```
 
-**What it does:** reads config and **instantiates every *enabled* channel** into a
-list (`loadChannels`), then starts them all (`startChannels`). The real loader does
-the same loop for ~20 channels; we only know WhatsApp.
-
-> 📘 **TS — `Channel[]`.** The `[]` means "an array of." `Channel[]` = "a list of
-> things satisfying the `Channel` interface." So `channels.push(...)` only accepts
-> valid channels, and `loadChannels` promises to return such a list.
-
-> 📘 **JS/TS — `new WhatsAppChannel(...)`.** `new` creates an instance of the class,
-> running its `constructor`. Because the class `implements Channel`, the instance fits
-> wherever a `Channel` is expected — that's why it can go straight into a `Channel[]`.
-
-> 📘 **JS — `for (const x of list) { await … }`.** Loops the array and `await`s each
-> `start()` in turn (sequential). `for…of` iterates *values* (vs `for…in`, which
-> iterates keys — a common beginner trap).
-
-### 9e. How `bootstrap.ts` wires step 5
-
-Three additions to the conductor:
+The **outbound + message adapter** (`channel-outbound.ts`) wraps it:
 
 ```ts
-// 1) an empty registry, created before the server:
-const channelsById = new Map<string, Channel>();
+import { defineChannelMessageAdapter, type ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-core.js";
+import { sendMessageWhatsApp } from "./send.js";
 
-// 2) the server gets it, and reads it AT REQUEST TIME (late-population trick):
+export const whatsappChannelOutbound: ChannelOutboundAdapter = {
+  sendText: async ({ to, text, replyToId }) => sendMessageWhatsApp(to, text, { replyToId }),
+};
+
+export const whatsappMessageAdapter = defineChannelMessageAdapter({
+  id: "whatsapp",
+  capabilities: { text: true, replyTo: true },
+  send: { text: async (ctx) => whatsappChannelOutbound.sendText({ to: ctx.to, text: ctx.text, replyToId: ctx.replyToId }) },
+});
+```
+
+The **plugin itself** (`channel.ts`) assembles the adapters via the factory:
+
+```ts
+import { createChatChannelPlugin, type ChannelPlugin } from "openclaw/plugin-sdk/channel-core.js";
+import { whatsappChannelOutbound, whatsappMessageAdapter } from "./channel-outbound.js";
+import { whatsappTransport } from "./channel.runtime.js";
+
+export const whatsappPlugin: ChannelPlugin = createChatChannelPlugin({
+  id: "whatsapp",
+  meta: { id: "whatsapp", label: "WhatsApp", selectionLabel: "WhatsApp", docsPath: "/channels/whatsapp", blurb: "…" },
+  capabilities: { chatTypes: ["direct", "group"], reactions: true, reply: true, media: true },
+  outbound: whatsappChannelOutbound,
+  message: whatsappMessageAdapter,
+  transport: whatsappTransport,
+});
+```
+
+And `register.ts` registers it into the catalog by **import side effect**:
+
+```ts
+import { registerChannelPlugin } from "openclaw/channels/plugins/catalog.js";
+import { whatsappPlugin } from "./channel.js";
+registerChannelPlugin(whatsappPlugin);   // runs when this file is first imported
+```
+
+> 📘 **TS — path-alias imports `openclaw/plugin-sdk/…`.** The extension imports the SDK
+> as `openclaw/plugin-sdk/channel-core.js`, exactly like the real plugin (which imports
+> `openclaw/plugin-sdk/*`). That `openclaw/*` prefix is a **path alias** defined in
+> `tsconfig.json` (`"paths": { "openclaw/*": ["src/*"] }`), so it resolves to our
+> `src/` tree. Aliases keep imports stable and package-like instead of long `../../../`
+> relative chains.
+
+> 📘 **JS — side-effect import `import "./register.js"`.** An import with **no `{ … }`**
+> doesn't pull in any value — it just **runs the module for its effects**. Importing
+> `register.ts` executes its top-level `registerChannelPlugin(whatsappPlugin)` line,
+> adding the plugin to the catalog. `bootstrap.ts` does exactly this:
+> `import "../extensions/whatsapp/src/register.js";`.
+
+> 📘 **TS — an object literal "satisfying" a type.** `whatsappPlugin: ChannelPlugin =
+> createChatChannelPlugin({ … })`. The big object literal is checked against
+> `ChannelPlugin` field by field — wrong field name or wrong adapter shape is a compile
+> error. No class, no `implements`: a plugin is just a well-typed object.
+
+### 9e. The manager — `src/channels/channel-manager.ts`
+
+This is the gateway side that **starts** channels and wires the full loop.
+
+```ts
+const connection = await plugin.transport.connect({
+  accountId: "default",
+  onInbound: async (msg) => {
+    const route = resolveInboundRoute({ cfg, channel: msg.channel, accountId: "default", peer: { kind: "direct", id: msg.from } });
+    const envelopeText = formatInboundEnvelope(msg);
+    const reply = await deps.runAgent(envelopeText);          // ← the agent
+    if (reply) await deliverReply(plugin, msg.from, reply);    // → message.send.text → sendMessageWhatsApp
+  },
+});
+```
+
+**What it does:** for each enabled plugin it calls `transport.connect({ onInbound })`.
+When a message arrives, `onInbound` runs the real loop: **route → format → run agent →
+deliver reply** (through the plugin's `message.send.text`). `deliverReply` calls
+`plugin.message.send.text(...)`, which calls `whatsappChannelOutbound.sendText`, which
+calls `sendMessageWhatsApp`.
+
+> 📘 **TS — passing a callback that the transport stores.** `onInbound` is a function we
+> hand to `connect`; the transport keeps it and calls it later for each inbound message
+> — the same "give Node/the transport a function, it calls you back" pattern as the HTTP
+> handlers.
+
+### 9f. How `bootstrap.ts` wires step 5
+
+```ts
+import { startChannels, stopChannels, type StartedChannel } from "./channels/channel-manager.js";
+import { runAgent } from "./agent/run-agent-stub.js";
+import "../extensions/whatsapp/src/register.js";   // side-effect: registers the plugin
+
+const channelsById = new Map<string, StartedChannel>();
 const httpServer = createBareGatewayHttpServer(() => resolvedAuth, channelsById);
 await listenGatewayHttpServer({ httpServer, bindHost, port });
 
-// 3) step 5: load → register into the map → start
-const channels = loadChannels(cfg, { processMessage });
+// STEP 5: load enabled plugins from the catalog + connect their transports
+const channels = await startChannels(cfg, { runAgent });
 for (const channel of channels) channelsById.set(channel.id, channel);
-await startChannels(channels);
 ```
 
-And a new HTTP route inside the server injects a simulated inbound message:
+The HTTP route now just **acknowledges** the inbound (the reply goes out the channel,
+not the HTTP response — like a real webhook):
 
 ```ts
-const inboundMatch = req.url?.match(/^\/channels\/([^/?]+)\/inbound$/);
-if (req.method === "POST" && inboundMatch) {
-  if (!isAuthorized(req)) { /* 401 */ return; }
-  const channel = channelsById.get(inboundMatch[1]);
-  if (!channel?.simulateInbound) { /* 404 */ return; }
-  const body = await readJsonBody(req);
-  const reply = await channel.simulateInbound(String(body.from ?? "unknown"), String(body.text ?? ""));
-  res.end(JSON.stringify({ ok: true, channel: channel.id, reply }));
-  return;
-}
+const started = channelsById.get(inboundMatch[1]);
+if (!started) { /* 404 */ return; }
+await started.connection.simulateInbound(String(body.from ?? "unknown"), String(body.text ?? ""));
+res.end(JSON.stringify({ ok: true, channel: started.id, accepted: true }));
 ```
 
-> 📘 **TS — `Map<string, Channel>` (a generic with TWO type parameters).** A `Map` is
-> a key→value lookup. The two slots say "keys are `string`s, values are `Channel`s." So
-> `channelsById.get("whatsapp")` is typed as `Channel | undefined` (the `undefined`
-> because the key might not exist — which is why the next line checks
-> `!channel?.simulateInbound`).
-
-> 📘 **The same late-population trick as `getAuth`.** The map is created *empty* and
-> passed to the server, then filled in step 5. The route reads it *at request time*, so
-> by the time any request arrives the channels are there. (If the server read it once
-> at setup, it'd see an empty map.)
-
-> 📘 **TS — `readJsonBody(req): Promise<Record<string, unknown>>`.** `Record<string,
-> unknown>` means "an object with string keys and values of unknown type" — i.e. "some
-> JSON object, but we don't know its fields." That's why the code wraps reads in
-> `String(body.from ?? "unknown")`: `body.from` is `unknown`, so we coerce it to a
-> string defensively. (Same untrusted-input caution as `JSON.parse … as`.)
-
-### The step-5 flow in one picture
+### The step-5 flow in one picture (real names)
 
 ```
 curl POST /channels/whatsapp/inbound {from, text}
-   └─ HTTP route → channelsById.get("whatsapp").simulateInbound(from, text)
-        └─ build InboundMessage  →  📥 log
-             └─ deps.processMessage(msg)        ← the agent (stub) decides the reply
-                  └─ channel.send({to, text})   ← 📤 back out the same channel
-                       └─ reply returned in the HTTP response too
+   └─ HTTP route → started.connection.simulateInbound(from, text)     (📥 stands in for messages.upsert)
+        └─ onInbound(msg)
+             ├─ resolveInboundRoute → { agentId:"main", sessionKey }   ([channels] routed → …)
+             ├─ formatInboundEnvelope(msg)
+             ├─ runAgent(envelopeText)                                  ← the agent (stub)
+             └─ whatsappMessageAdapter.send.text(ctx)
+                  └─ whatsappChannelOutbound.sendText
+                       └─ sendMessageWhatsApp(to, text)   (📤  → Baileys in the real plugin)
 ```
 
-That mirrors the real daemon's **channel ingress → routing → agent run → outbound
-delivery** — just with a faked transport and a one-line agent.
+That is the real daemon's **channel ingress → routing → agent run → outbound
+delivery**, with the genuine plugin/adapter names — only the transport and the agent
+are faked.
 
 ---
 
@@ -1043,11 +1085,11 @@ delivery** — just with a faked transport and a one-line agent.
 2. The bottom line `main().catch(...)` kicks off `main()`.
 3. `main` reads config, then runs steps 1→2→3→4, logging each.
 4. `listenGatewayHttpServer` binds the port.
-5. Step 5: `loadChannels` builds the channel list, they're registered into
-   `channelsById`, and `startChannels` starts each one. The program now sits idle,
-   kept alive by the open server, the file watcher, and the running channels.
+5. Step 5: importing `register.js` (side effect) put `whatsappPlugin` in the catalog;
+   `startChannels` reads the enabled plugins and connects each transport. The program
+   now sits idle, kept alive by the open server, the file watcher, and the channels.
 6. HTTP/WS requests trigger the callbacks in `createBareGatewayHttpServer` — including
-   `POST /channels/whatsapp/inbound`, which runs the ingress→agent→egress loop.
+   `POST /channels/whatsapp/inbound`, which runs the route→agent→outbound loop.
 7. Editing `openclaw.json` triggers the watcher → `loadConfig` → `onConfig` →
    `resolvedAuth` is reassigned → new token takes effect.
 8. `Ctrl-C` sends `SIGINT`; the handler stops the channels, stops the watcher, and
@@ -1060,28 +1102,30 @@ delivery** — just with a faked transport and a one-line agent.
 | Feature | Looks like | Means |
 |---|---|---|
 | Type annotation | `x: number` | x is a number |
-| Optional property/param | `port?: number` | may be missing |
-| Optional method | `m?(): void` | the method may be absent |
+| Optional property/param | `port?: number`, `message?: …` | may be missing |
 | Union | `"a" \| "b"` / `string \| null` | one of several |
-| Type alias | `type T = {…}` | name a shape |
-| Interface | `interface T {…}` | a shape a class can `implements` |
-| Object type | `{ id: string }` | shape of an object |
+| Open union | `"a" \| (string & {})` | known literals (autocomplete) + any string |
+| Type alias / object type | `type T = { id: string }` | name a shape |
 | Function type | `() => void` | shape of a function |
-| `readonly` | `readonly id: string` | can't be reassigned after set |
-| `class … implements I` | `class C implements Channel` | C must satisfy interface I |
-| `new` | `new WhatsAppChannel(...)` | create a class instance |
+| `readonly` | `readonly cause` | can't be reassigned after set |
+| `class` / `extends` | `class GatewayLockError extends Error` | a class (here, a custom error) |
+| Parameter property | `constructor(private readonly x)` | declare+assign field in one go |
+| `new` | `new Map(...)`, `new Promise(...)` | construct an instance |
+| Identity factory | `defineX(cfg): X { return cfg }` | type-checks + autocompletes the arg at the call site |
 | `unknown` | `value: unknown` | anything — must narrow before use |
 | `any` | (avoided here) | anything — no checking (escape hatch) |
 | `void` | `): void` | returns nothing useful |
 | Type guard / narrowing | `if (typeof x === "string")` | prove a type, then use it |
 | `as` assertion | `data as Config` | "trust me, it's this type" |
+| `keyof` | `keyof ChannelsConfig` | the union of a type's keys |
 | `import type` | `import type { T }` | import a type only (erased) |
 | Inline value+type import | `import { f, type T }` | mix in one line |
+| Side-effect import | `import "./register.js"` | run a module for its effects (no values) |
+| Path alias import | `import … from "openclaw/plugin-sdk/…"` | tsconfig `paths` → maps to `src/*` |
 | Indexed access | `T["field"]` | the type of that field |
-| Generic usage | `Promise<T>`, `Set<T>`, `Channel[]` | a container of T |
-| Two-param generic | `Map<string, Channel>` | key type, value type |
+| Generic usage | `Promise<T>`, `ChannelPlugin[]` | a container of T |
+| Two-param generic | `Map<ChannelId, ChannelPlugin>` | key type, value type |
 | `Record<K, V>` | `Record<string, unknown>` | object with K keys, V values |
-| Parameter property | `constructor(private readonly x)` | declare+assign field in one go |
 | Inference | `const n = f()` | TS figures the type out for you |
 
 And the JS operators that pair with them: `?.` (optional chaining), `??` (nullish
@@ -1094,15 +1138,15 @@ default), ternary `a ? b : c`, destructuring `const { x } = obj`, `async/await`,
 
 - Open each real file alongside this doc and match the `📘` notes to the code.
 - Change something and watch TS complain: set `port: "abc"` in `openclaw.json`'s
-  *type* expectations, or call `resolveGatewayPort(123)` in `bootstrap.ts`, or delete
-  `stop()` from `WhatsAppChannel` (TS will say it no longer `implements Channel`) —
-  the editor underlines it in red **before** you run.
-- Run it and POST a message to `POST /channels/whatsapp/inbound` (see
-  [README.md](README.md)) to watch the step-5 ingress→agent→egress loop print live.
-- Add a second channel: copy `whatsapp/channel.ts` to `telegram/channel.ts`, change
-  the `id`, and register it in `registry.ts` behind `channels.telegram?.enabled`.
-  Because both `implements Channel`, the registry and routing need no other changes —
-  a good feel for why the interface exists.
+  *type* expectations, call `resolveGatewayPort(123)` in `bootstrap.ts`, or remove the
+  `send` field from `whatsappMessageAdapter` (TS will reject the
+  `defineChannelMessageAdapter({…})` call) — the editor underlines it **before** you run.
+- Run it and POST to `POST /channels/whatsapp/inbound` (see [README.md](README.md)) to
+  watch the step-5 route→agent→outbound loop print live.
+- Add a second channel: copy `extensions/whatsapp/` to `extensions/telegram/`, change the
+  `id` to `"telegram"`, add `telegram?` to `ChannelsConfig`, import its `register.js` in
+  `bootstrap.ts`, and set `channels.telegram.enabled: true`. The catalog + manager need
+  **no** other changes — every channel flows through the same `ChannelPlugin` contract.
 - Then read [README.md](README.md) for the run/poke commands and the map back to the
   real OpenClaw source, and [`../openclaw-daemon-internals.md`](../openclaw-daemon-internals.md)
   for what happens *after* these steps (the real agent loop, sessions, more channels).
