@@ -48,6 +48,7 @@ async function startChannel(
 
   const connection = await plugin.transport.connect({
     accountId: "default",
+    cfg,
     onInbound: async (msg) => {
       // (1) route: channel/peer → agentId + sessionKey
       const route = resolveInboundRoute({

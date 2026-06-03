@@ -138,28 +138,64 @@ inbound → resolveInboundRoute → runAgent → whatsappMessageAdapter.send.tex
         → whatsappChannelOutbound.sendText → sendMessageWhatsApp(to, text)  [→ Baileys]
 ```
 
-#### A second channel — Microsoft Teams
+#### A second channel — Microsoft Teams (with a real "read" path)
 
-MS Teams is also a real bundled plugin (`extensions/msteams/`), so it's added the same
-way — and adding it needed **zero changes** to the catalog, manager, router, or agent.
-Just the plugin files + one side-effect import + config. The genuine differences are
-preserved:
+MS Teams is also a real bundled plugin (`extensions/msteams/`), added the same way —
+**zero changes** to the catalog, manager, router, or agent. The genuine differences
+are preserved:
 
 - `sendMessageMSTeams({ to, text })` takes a **params object** (WhatsApp's is positional)
-- `msteamsMessageAdapter` is built with **`createChannelMessageAdapterFromOutbound`** (WhatsApp hand-writes `defineChannelMessageAdapter`)
+- `msteamsMessageAdapter` is built with **`createChannelMessageAdapterFromOutbound`**
 - capabilities `["direct", "channel", "thread"]` (Teams has no "group")
-- transport is **Bot Framework / Azure Bot Service** (simulated here), not Baileys
+- transport is **Bot Framework / Azure Bot Service**
 
-```bash
-curl -s -H "Authorization: Bearer dev-secret-token" -H "content-type: application/json" \
-  -d '{"from":"user@contoso.com","text":"hi teams"}' \
-  http://127.0.0.1:18789/channels/msteams/inbound
-# → {"ok":true,"channel":"msteams","accepted":true}
-# console: 📥 [msteams ← user@contoso.com] hi teams → routed → 📤 [msteams → …]
+Unlike WhatsApp's fully-simulated transport, the MS Teams **inbound ("read") path is
+real and faithful** to `extensions/msteams/src/monitor.ts`. On startup it stands up the
+Bot Framework **messaging endpoint** — `POST /api/messages` on **port 3978** (separate
+from the gateway's 18789, exactly like the real plugin) — wiring the genuine pieces:
+
+```
+monitorMSTeamsProvider          (monitor.ts)        — stands up the webhook
+  ├─ resolveMSTeamsCredentials  (token.ts)          — appId / tenant / secret
+  ├─ createBotFrameworkJwtValidator (sdk.ts)        — local mode skips JWT
+  ├─ createMSTeamsAdapter        (sdk.ts)           — process(activity, run)
+  ├─ buildActivityHandler + registerMSTeamsHandlers (monitor-handler.ts) — dispatch by activity.type
+  └─ MSTeamsConversationStore    (conversation-store.ts) — stores ConversationReference for proactive replies
 ```
 
-That a new channel drops in with no core changes is the whole point of the
-`ChannelPlugin` contract — exactly how the real product onboards ~20 channels.
+**Local/emulator mode:** with no `channels.msteams.appPassword`, JWT validation is
+disabled (just like running against the Bot Framework Emulator), so you can POST a
+sample Activity yourself — no Azure needed:
+
+```bash
+curl -i -X POST http://127.0.0.1:3978/api/messages \
+  -H "Authorization: Bearer local-dev" -H "content-type: application/json" \
+  -d '{"type":"message","text":"hello from Teams",
+       "from":{"id":"29:user1","name":"Alice","aadObjectId":"aad-123"},
+       "conversation":{"id":"19:conv1","conversationType":"personal"},
+       "recipient":{"id":"28:bot","name":"OpenClaw"},
+       "channelId":"msteams","serviceUrl":"https://smba.trafficmanager.net/amer/"}'
+# → HTTP 200 {}
+# console: [msteams] inbound message conv=19:conv1 from=aad-123 direct=true
+#          [channels] routed → agent:main:main
+#          📤 [msteams → Alice] 🤖 (echo agent) …
+```
+
+A request with no `Authorization: Bearer …` is rejected `401` (the real pre-parse auth
+gate). The activity-type switch (`message` / `conversationUpdate` / `messageReaction`),
+the `aadObjectId ?? id` sender, and `conversationType === "personal"` → direct are all
+mirrored from the real handler.
+
+**Going fully real (live Teams messages)** needs only external setup the code can't
+provide: an Azure Bot registration (`appId` + `appPassword`), a **public HTTPS tunnel**
+to `:3978/api/messages`, and a sideloaded Teams app manifest. Then set `appPassword`
+(JWT validation turns on) and swap the three `sdk.ts` functions to load
+`@microsoft/teams.apps` — the callers in `monitor.ts` don't change. See
+`../openclaw-msteams-manual-setup.md`.
+
+> The **outbound** side (`sendMessageMSTeams`) is still simulated (prints `📤`); making
+> it real means `adapter.continueConversation(ref)` using the stored conversation
+> reference — which the read path already saves.
 
 ### Try the other precedence rules
 
@@ -198,7 +234,8 @@ Every file names its origin at the top. Relative paths mirror the real repo.
 | `extensions/whatsapp/src/send.ts` | same | 5 | **Simulated leaf**: `sendMessageWhatsApp` prints instead of Baileys |
 | `extensions/whatsapp/src/channel.runtime.ts` | `channel.runtime.ts` + `connection-controller.ts` | 5 | **Simulated transport** (no Baileys/QR) |
 | `extensions/whatsapp/src/{accounts,register}.ts` | same | 5 | **Faithful subset**: account resolve + bundled registration |
-| `extensions/msteams/src/*.ts` | `extensions/msteams/src/*` | 5 | **Faithful subset**: `msteamsPlugin`, `sendMessageMSTeams`, `createChannelMessageAdapterFromOutbound`; Bot Framework transport simulated |
+| `extensions/msteams/src/{channel,channel-outbound,send,accounts,register}.ts` | same | 5 | **Faithful subset**: `msteamsPlugin`, `sendMessageMSTeams`, `createChannelMessageAdapterFromOutbound` (outbound simulated) |
+| `extensions/msteams/src/{monitor,monitor-handler,sdk,token,conversation-store}.ts` | same | 5 | **Faithful + real read path**: `monitorMSTeamsProvider` Bot Framework webhook (`/api/messages`:3978), activity-type dispatch, JWT validator (local mode), conversation store |
 | `src/agent/run-agent-stub.ts` | embedded Pi agent (`runEmbeddedPiAgent`) | 5 | **Stub**: echo instead of the real agent loop |
 | `src/bootstrap.ts` | *(new)* | 1–5 | Orchestrator — stands in for `startGatewayServer` |
 

@@ -125,7 +125,11 @@ export type ChannelConnection = {
   simulateInbound(from: string, text: string): Promise<void>;
 };
 export type ChannelTransport = {
-  connect(params: { accountId: string; onInbound: InboundHandler }): Promise<ChannelConnection>;
+  connect(params: {
+    accountId: string;
+    cfg: OpenClawConfig;
+    onInbound: InboundHandler;
+  }): Promise<ChannelConnection>;
 };
 
 // ── ChannelPlugin (faithful subset of src/channels/plugins/types.plugin.ts) ─

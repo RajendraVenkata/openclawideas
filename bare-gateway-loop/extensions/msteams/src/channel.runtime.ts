@@ -1,27 +1,32 @@
 // ──────────────────────────────────────────────────────────────────────────
-// SIMULATED transport — real origin: extensions/msteams/src/channel.runtime.ts,
-// which uses the **Bot Framework / Azure Bot Service**: a CloudAdapter created
-// from the app credentials, inbound `Activity` objects arriving via an HTTP
-// `POST /api/messages` endpoint, and stored conversation references for proactive
-// replies. None of that runs offline, so we fake the wire while keeping the same
-// connect → onInbound → stop shape.
+// MS Teams transport — the "read" path is REAL (faithful), the outbound is still
+// simulated. On connect it calls the faithful `monitorMSTeamsProvider`, which
+// stands up the Bot Framework messaging endpoint (POST /api/messages, port 3978)
+// and routes inbound Activities to `onInbound`.
+//
+// Real origin: extensions/msteams/src/channel.runtime.ts + monitor.ts. The real
+// transport validates JWTs and uses the @microsoft/teams SDK adapter; this runs
+// in local/emulator mode (no Azure) so you can POST a sample Activity to test it.
 // ──────────────────────────────────────────────────────────────────────────
 
 import type { ChannelConnection, ChannelTransport } from "openclaw/plugin-sdk/channel-core.js";
+import { monitorMSTeamsProvider } from "./monitor.js";
 
 export const msteamsTransport: ChannelTransport = {
-  async connect({ accountId, onInbound }) {
-    console.log(`[msteams] connecting (account=${accountId}) — SIMULATED, no Bot Framework`);
-    // REAL:
-    //   const adapter = new CloudAdapter(botFrameworkAuth);
-    //   httpServer.post("/api/messages", (req, res) =>
-    //     adapter.process(req, res, (ctx) => onInbound(toInbound(ctx.activity))));
+  async connect({ accountId, cfg, onInbound }) {
+    console.log(`[msteams] connecting (account=${accountId}) — Bot Framework webhook`);
+
+    // Start the real inbound webhook (READ path).
+    const { shutdown } = await monitorMSTeamsProvider({ cfg, onInbound });
+
     const connection: ChannelConnection = {
       async stop() {
-        console.log("[msteams] disconnected");
+        await shutdown();
       },
+      // Convenience for quick testing without crafting a full Activity: inject
+      // straight into onInbound (bypasses the webhook + auth gate).
       async simulateInbound(from, text) {
-        console.log(`📥 [msteams ← ${from}] ${text}`);
+        console.log(`📥 [msteams ← ${from}] ${text} (direct inject)`);
         await onInbound({ channel: "msteams", from, body: text, timestamp: Date.now() });
       },
     };

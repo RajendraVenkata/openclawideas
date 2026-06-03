@@ -22,6 +22,13 @@ export type MSTeamsChannelConfig = {
   appId?: string;
   /** Azure AD tenant id. */
   tenantId?: string;
+  /** Bot Framework app secret. When unset, the webhook runs in local/emulator mode (JWT validation off). */
+  appPassword?: string;
+  /** Inbound messaging endpoint (Bot Framework). Defaults: port 3978, path /api/messages. */
+  webhook?: {
+    port?: number;
+    path?: string;
+  };
 };
 
 export type ChannelsConfig = {
