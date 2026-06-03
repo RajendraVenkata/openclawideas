@@ -1,0 +1,17 @@
+{
+  // Sample config the bare loop reads (real path: ~/.openclaw/openclaw.json, JSON5).
+  // Edit this while the gateway is running to watch step 3 hot-reload the snapshot.
+  "gateway": {
+    "port": 18789,
+    "bind": "loopback",
+    "auth": {
+      // mode defaults to "token" when only a token is set (see auth-resolve.ts).
+      // If you set BOTH token and password without "mode", startup fails (step 2 guard).
+      "token": "dev-secret-token"
+    },
+    "reload": {
+      "mode": "hybrid",
+      "debounceMs": 300
+    }
+  }
+}

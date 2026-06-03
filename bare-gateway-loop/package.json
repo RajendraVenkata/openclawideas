@@ -1,0 +1,13 @@
+{
+  "name": "bare-gateway-loop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Faithful extraction of OpenClaw gateway startup steps 1-4 (port, auth, hot-reload, HTTP/WS listen).",
+  "scripts": {
+    "start": "tsx src/bootstrap.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}
