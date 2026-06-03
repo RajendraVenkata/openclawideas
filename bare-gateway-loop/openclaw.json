@@ -13,5 +13,18 @@
       "mode": "hybrid",
       "debounceMs": 300
     }
+  },
+  "channels": {
+    "whatsapp": {
+      "enabled": true,
+      "accountId": "default",
+      "dmPolicy": "open"
+    },
+    "msteams": {
+      "enabled": true,
+      "accountId": "default",
+      "appId": "00000000-0000-0000-0000-000000000000",
+      "tenantId": "contoso.onmicrosoft.com"
+    }
   }
 }

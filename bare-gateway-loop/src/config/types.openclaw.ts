@@ -6,11 +6,13 @@
 // only reads `gateway` and `secrets.defaults`, so this shim carries just those.
 // ──────────────────────────────────────────────────────────────────────────
 
+import type { ChannelsConfig } from "./types.channels.js";
 import type { GatewayConfig } from "./types.gateway.js";
 import type { SecretDefaults } from "./types.secrets.js";
 
 export type OpenClawConfig = {
   gateway?: GatewayConfig;
+  channels?: ChannelsConfig;
   secrets?: {
     defaults?: SecretDefaults;
   };

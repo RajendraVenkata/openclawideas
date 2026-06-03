@@ -1,21 +1,26 @@
-# Bare Gateway Loop — OpenClaw startup steps 1–4
+# Bare Gateway Loop — OpenClaw startup steps 1–5
 
-A **faithful, runnable extraction** of the first four things the OpenClaw Gateway
+A **faithful, runnable extraction** of the first things the OpenClaw Gateway
 daemon does when it boots, taken from the `openclaw` repo:
 
 1. **Port resolution** — `OPENCLAW_GATEWAY_PORT` → `gateway.port` → `18789`
 2. **Auth layer** — resolve token / password / trusted-proxy / none
 3. **Config hot-reload watcher** — `gateway.reload.mode` (default `hybrid`)
 4. **HTTP/WebSocket server** — single multiplexed listener
+5. **Channels** — load + register + start every enabled channel (here: WhatsApp)
 
-The goal is to see *how it was coded ground up*. Wherever possible the files here
-are the **real openclaw source, copied verbatim**, kept at their **real relative
-paths** (`src/config/…`, `src/gateway/…`, `src/gateway/server/…`) with their real
-imports intact. Only a few leaves are shimmed/condensed where the genuine
-dependency tree explodes — each is clearly labelled at the top of the file.
+The goal is to see *how it was coded ground up*. For steps 1–4, wherever possible
+the files here are the **real openclaw source, copied verbatim**, kept at their
+**real relative paths** (`src/config/…`, `src/gateway/…`, `src/gateway/server/…`)
+with their real imports intact. Only a few leaves are shimmed/condensed where the
+genuine dependency tree explodes — each is clearly labelled at the top of the file.
 
-This corresponds to **section "2. Startup sequence — what the daemon boots"**,
-points 1–4, in `../openclaw-daemon-internals.md`.
+Step 5 (channels) is a **faithful-in-shape** mini-subsystem with a **simulated
+WhatsApp transport** — see [the channels note](#step-5--channels-whatsapp) for why.
+
+This corresponds to **section "2. Startup sequence — what the daemon boots"** in
+`../openclaw-daemon-internals.md` (points 1–4 are startup; channels are part of the
+broader boot the doc describes).
 
 ---
 
@@ -35,6 +40,9 @@ You'll see each step happen:
 [gateway] step 2 — auth mode=token (source=token) secret=set (16 chars) allowTailscale=false
 [gateway] step 3 — reload mode=hybrid debounceMs=300 (watching …/openclaw.json)
 [gateway] step 4 — listening on ws://127.0.0.1:18789  (HTTP + WebSocket)
+[gateway] channel registered: whatsapp (WhatsApp)
+[whatsapp] connecting (account=default) — SIMULATED, no Baileys/QR
+[gateway] step 5 — channels started: whatsapp
 [gateway] ready. Try: …
 ```
 
@@ -74,6 +82,85 @@ While it's running, edit `openclaw.json` (e.g. change the `token`). Within
 in-memory snapshot was swapped live, exactly as `gateway.reload.mode: "hot"/"hybrid"`
 does in the real daemon.
 
+### Step 5 — channels (WhatsApp)
+
+Simulate an inbound WhatsApp message (the real transport would deliver this; here
+we inject it over HTTP):
+
+```bash
+curl -s -H "Authorization: Bearer dev-secret-token" -H "content-type: application/json" \
+  -d '{"from":"+15551234567","text":"hello from my phone"}' \
+  http://127.0.0.1:18789/channels/whatsapp/inbound
+# → {"ok":true,"channel":"whatsapp","accepted":true}
+```
+
+The HTTP response just **acknowledges** the message (like a real inbound webhook); the
+reply is delivered back out the channel. In the gateway console you'll see the full
+**ingress → route → agent → egress** roundtrip:
+
+```
+📥 [whatsapp ← +15551234567] hello from my phone
+[channels] routed → agent:main:main
+📤 [whatsapp → +15551234567] 🤖 (echo agent) [whatsapp] from +15551234567: hello from my phone — …
+```
+
+Other behaviours: an unknown channel → `404 NO_SUCH_CHANNEL`; missing token → `401`.
+Set `channels.whatsapp.enabled: false` in `openclaw.json` and step 5 logs
+`channels started: (none enabled)`.
+
+#### How faithful is step 5? (and where real Baileys goes)
+
+Step 5 uses the **real OpenClaw channel-plugin names and shapes** — `ChannelPlugin`,
+`createChatChannelPlugin`, `defineChannelMessageAdapter`, `whatsappPlugin`,
+`whatsappChannelOutbound`, `whatsappMessageAdapter`, `sendMessageWhatsApp`, a plugin
+**catalog**, and the inbound **route/envelope** — laid out across the real paths
+(`src/plugin-sdk/`, `src/channels/plugins/`, `extensions/whatsapp/src/`). It is a
+faithful **subset**: the real `ChannelPlugin` has ~40 adapter slots; we implement the
+few a text channel needs.
+
+Only two things are **stubbed**, both clearly labelled:
+
+| Stubbed here | Real WhatsApp |
+|---|---|
+| `whatsappTransport.connect()` (prints, no wire) | `extensions/whatsapp/src/channel.runtime.ts` + `connection-controller.ts` — **Baileys**: `makeWASocket()`, QR pairing, encryption, `messages.upsert` |
+| `runAgent()` echo (`src/agent/run-agent-stub.ts`) | the embedded Pi **agent loop** (`runEmbeddedPiAgent`) |
+
+So everything **above** the wire — catalog registration, config-gated loading,
+connecting the transport, routing inbound to an `{ agentId, sessionKey }`, running the
+agent, and delivering the reply via `message.send.text → outbound.sendText →
+sendMessageWhatsApp` — uses the genuine structure. Only the bottom wire and the agent
+are faked.
+
+The full delivery chain, real names:
+
+```
+inbound → resolveInboundRoute → runAgent → whatsappMessageAdapter.send.text(ctx)
+        → whatsappChannelOutbound.sendText → sendMessageWhatsApp(to, text)  [→ Baileys]
+```
+
+#### A second channel — Microsoft Teams
+
+MS Teams is also a real bundled plugin (`extensions/msteams/`), so it's added the same
+way — and adding it needed **zero changes** to the catalog, manager, router, or agent.
+Just the plugin files + one side-effect import + config. The genuine differences are
+preserved:
+
+- `sendMessageMSTeams({ to, text })` takes a **params object** (WhatsApp's is positional)
+- `msteamsMessageAdapter` is built with **`createChannelMessageAdapterFromOutbound`** (WhatsApp hand-writes `defineChannelMessageAdapter`)
+- capabilities `["direct", "channel", "thread"]` (Teams has no "group")
+- transport is **Bot Framework / Azure Bot Service** (simulated here), not Baileys
+
+```bash
+curl -s -H "Authorization: Bearer dev-secret-token" -H "content-type: application/json" \
+  -d '{"from":"user@contoso.com","text":"hi teams"}' \
+  http://127.0.0.1:18789/channels/msteams/inbound
+# → {"ok":true,"channel":"msteams","accepted":true}
+# console: 📥 [msteams ← user@contoso.com] hi teams → routed → 📤 [msteams → …]
+```
+
+That a new channel drops in with no core changes is the whole point of the
+`ChannelPlugin` contract — exactly how the real product onboards ~20 channels.
+
 ### Try the other precedence rules
 
 ```bash
@@ -101,7 +188,19 @@ Every file names its origin at the top. Relative paths mirror the real repo.
 | `src/config/types.gateway.ts` | same | — | **Shim**: only the touched type fragments, copied verbatim |
 | `src/config/types.openclaw.ts` | same | — | **Shim**: minimal root config (only `gateway` + `secrets.defaults`) |
 | `src/config/types.secrets.ts` | same | — | **Shim**: `resolveSecretInputRef` / `hasConfiguredSecretInput` for the inline-string case; full SecretRef provider system omitted |
-| `src/bootstrap.ts` | *(new)* | 1–4 | Orchestrator — stands in for `startGatewayServer` |
+| `src/config/types.channels.ts` | `src/channels/channel-config.ts` + plugin configs | 5 | **Shim**: WhatsApp config only |
+| `src/plugin-sdk/channel-core.ts` | `src/channels/plugins/{channel-id.types,types.core,types.adapters,types.plugin}.ts` + `src/plugin-sdk/channel-{core,message}.ts` | 5 | **Faithful subset**: real names (`ChannelPlugin`, `createChatChannelPlugin`, `defineChannelMessageAdapter`); ~40 adapters → a few |
+| `src/plugin-sdk/inbound-envelope.ts` | same | 5 | **Faithful subset**: `resolveInboundRoute` + envelope formatting |
+| `src/channels/plugins/catalog.ts` | `src/channels/plugins/catalog.ts` + `src/plugins/*` | 5 | **Faithful subset**: plugin registry + enabled-plugin lookup |
+| `src/channels/channel-manager.ts` | gateway channel subsystem | 5 | **Faithful shape**: connect transports, route inbound, deliver replies |
+| `extensions/whatsapp/src/channel.ts` | `extensions/whatsapp/src/channel.ts` | 5 | **Faithful**: `whatsappPlugin = createChatChannelPlugin({…})` (adapter subset) |
+| `extensions/whatsapp/src/channel-outbound.ts` | same | 5 | **Faithful**: `whatsappChannelOutbound` + `whatsappMessageAdapter` |
+| `extensions/whatsapp/src/send.ts` | same | 5 | **Simulated leaf**: `sendMessageWhatsApp` prints instead of Baileys |
+| `extensions/whatsapp/src/channel.runtime.ts` | `channel.runtime.ts` + `connection-controller.ts` | 5 | **Simulated transport** (no Baileys/QR) |
+| `extensions/whatsapp/src/{accounts,register}.ts` | same | 5 | **Faithful subset**: account resolve + bundled registration |
+| `extensions/msteams/src/*.ts` | `extensions/msteams/src/*` | 5 | **Faithful subset**: `msteamsPlugin`, `sendMessageMSTeams`, `createChannelMessageAdapterFromOutbound`; Bot Framework transport simulated |
+| `src/agent/run-agent-stub.ts` | embedded Pi agent (`runEmbeddedPiAgent`) | 5 | **Stub**: echo instead of the real agent loop |
+| `src/bootstrap.ts` | *(new)* | 1–5 | Orchestrator — stands in for `startGatewayServer` |
 
 ---
 
@@ -120,7 +219,12 @@ entry.ts                         (src/entry.ts)
             ├─ startGatewayConfigReloader()
             │                             (src/gateway/config-reload.ts)     ← STEP 3   [condensed here]
             ├─ createGatewayHttpServer()  (src/gateway/server-http.ts:473)   ← builds full handler (omitted)
-            └─ listenGatewayHttpServer()  (src/gateway/server/http-listen.ts)← STEP 4   [verbatim here]
+            ├─ listenGatewayHttpServer()  (src/gateway/server/http-listen.ts)← STEP 4   [verbatim here]
+            └─ startChannels()            (gateway channel subsystem)        ← STEP 5   [faithful subset here]
+                 ├─ getEnabledChannelPlugins()  (src/channels/plugins/catalog.ts)
+                 └─ whatsappPlugin = createChatChannelPlugin({…})  (extensions/whatsapp/src/channel.ts)
+                      ├─ transport.connect()      (channel.runtime.ts + connection-controller.ts → Baileys) [simulated]
+                      └─ message.send.text → outbound.sendText → sendMessageWhatsApp()  (send.ts → Baileys)  [simulated]
 ```
 
 `bootstrap.ts` calls the same primitives in the same order. The big piece it does
