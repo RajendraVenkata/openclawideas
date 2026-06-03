@@ -190,8 +190,8 @@ mirrored from the real handler.
 provide: an Azure Bot registration (`appId` + `appPassword`), a **public HTTPS tunnel**
 to `:3978/api/messages`, and a sideloaded Teams app manifest. Then set `appPassword`
 (JWT validation turns on) and swap the three `sdk.ts` functions to load
-`@microsoft/teams.apps` — the callers in `monitor.ts` don't change. See
-`../openclaw-msteams-manual-setup.md`.
+`@microsoft/teams.apps` — the callers in `monitor.ts` don't change.
+**See [SETUP-MSTEAMS.md](SETUP-MSTEAMS.md)** for the step-by-step Azure Portal procedure.
 
 > The **outbound** side (`sendMessageMSTeams`) is still simulated (prints `📤`); making
 > it real means `adapter.continueConversation(ref)` using the stored conversation
