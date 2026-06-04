@@ -101,6 +101,34 @@ session key is also what serializes runs (next).
 Net effect: runs are serialized **per session** and capped **per global lane**, preventing
 tool/transcript races.
 
+### 1e. The inbound gate order — everything that can stop a message before the agent
+
+A message passes through a series of gates; **each one can drop, defer, fast-path, or
+transform it before a model run ever starts.** In rough order:
+
+| # | Gate | What it does | Where (real code) |
+|---|---|---|---|
+| 1 | **Transport auth** | Did the request even reach the channel legitimately? (per-channel — e.g. WhatsApp's paired session, MS Teams' Bot Framework **JWT**, a webhook secret). Fails closed. | each channel plugin (`extensions/<id>/…`) |
+| 2 | **Sender authorization (security model)** | Is *this sender* allowed to talk to the agent? `dmPolicy` (`open`/`allowlist`/`pairing`/`disabled`) + `allowFrom`. Unknown sender under `pairing` → a pairing code is issued and the message is **not processed** until approved. | `src/channels/allow-from.ts` (`isSenderIdAllowed`), pairing in `src/pairing/**` + channel pairing adapters |
+| 3 | **Dedupe** | Same platform message redelivered (reconnect)? Dropped. | `src/auto-reply/reply/inbound-dedupe.ts` (`buildInboundDedupeKey`, `claimInboundDedupe`) |
+| 4 | **Debounce / coalesce** | Rapid consecutive messages from the same sender are merged into one turn (so a 3-line burst isn't 3 runs). | `src/auto-reply/inbound-debounce.ts` (`debounceMs` ← `messages.inbound.debounceMs`) |
+| 5 | **Slash-command fast path** | `/new`, `/reset`, `/think`, `/status`, `/allowlist`, … are handled **without the model** and return early. | `src/auto-reply/command-detection.ts`, `commands-registry.ts`; intercepted in `get-reply.ts` (~:297) |
+| 6 | **Activation / mention gating** | In groups/channels, only act when addressed (e.g. require an @mention) per `activation mention|always`. | `src/auto-reply/command-gating.ts` + per-channel `requireMention` (e.g. `extensions/whatsapp/src/group-policy.ts`) |
+| 7 | **Queue / steer** | If a run is already active for this session, decide how the new message joins it — `steer` (inject into the running turn), `followup` (run after), `collect` (coalesce into one later turn), or `interrupt` (abort + run newest). | `src/auto-reply/reply/queue/normalize.ts` + `directive.ts` + `drain.ts`; `interrupt` in `abort-primitives.ts` |
+| 8 | **→ Agent run** | Only a message that survives all of the above starts `runEmbeddedPiAgent`. | `src/auto-reply/reply/agent-runner-execution.ts` |
+
+Outcomes, summarized:
+- **Dropped** → dedupe hit, `dmPolicy:"disabled"`, or not allowlisted under `allowlist`.
+- **Held / answered out-of-band** → `pairing` issues a code; the sender must be approved first.
+- **Answered without the model** → slash-command fast path.
+- **Merged** → debounce (same sender, rapid) or `collect` (during an active run).
+- **Deferred / steered** → `followup` / `steer` / `interrupt` when a run is in flight.
+- **Run** → everything else reaches the agent.
+
+> This is why "the agent ran" is the *exception path*, not the default: most of the inbound
+> machinery exists to decide whether a model turn should happen **at all**, and in what
+> session — treating inbound DMs as untrusted input throughout.
+
 ---
 
 ## 2. Phase 2 — The agentic runtime (running the agent)
@@ -283,8 +311,10 @@ message delivered to the same conversation/peer
    transport, then **subscribes to events**.
 2. **The session key is the spine.** It picks the transcript, serializes runs (per-session
    lane), and routes replies back (originating channel/peer carried alongside it).
-3. **Inbound is gated before the agent:** dedupe, debounce, slash-command fast paths,
-   queueing, and (per the security model) `dmPolicy`/pairing — only then does a run start.
+3. **Inbound is gated before the agent** (see **§1e** for the full ordered list): transport
+   auth → sender authorization (`dmPolicy`/`allowFrom`/pairing) → dedupe → debounce →
+   slash-command fast path → activation/mention gating → queue/steer — only a message that
+   survives all of these starts a model run.
 4. **Outbound is a pipeline, not a single send:** normalize → `NO_REPLY` filter → chunk →
    route-to-origin → deliver, with optional **live draft editing** on streaming channels.
 5. **`NO_REPLY`** is how the agent chooses silence — a normalized-to-null payload is simply
