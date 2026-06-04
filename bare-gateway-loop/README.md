@@ -323,6 +323,9 @@ Every file names its origin at the top. Relative paths mirror the real repo.
 | `extensions/msteams/src/{channel,channel-outbound,send,accounts,register}.ts` | same | 5 | **Faithful subset**: `msteamsPlugin`, `sendMessageMSTeams`, `createChannelMessageAdapterFromOutbound` (outbound simulated) |
 | `extensions/msteams/src/{monitor,monitor-handler,sdk,token,conversation-store}.ts` | same | 5 | **Faithful + real read path**: `monitorMSTeamsProvider` Bot Framework webhook (`/api/messages`:3978), activity-type dispatch, JWT validator (local mode), conversation store |
 | `extensions/webhook/src/*.ts` | *(custom)* — ported from `../custom-webhook-channel` | 5 | **Custom channel**: HTTP webhook inbound (:4000) + async outbound POST; same `ChannelPlugin` contract |
+| `src/gateway/ws-frame.ts` | RFC6455 codec | 4/WS | WebSocket data-frame encode/decode |
+| `src/gateway/ws-hub.ts` | `src/gateway/ws-connection.ts` + protocol | 4/WS | **Real WS protocol** (v4): connect.challenge → connect → hello-ok, req/res, event push, connection registry (name→conn) |
+| `extensions/cli/src/*.ts` | *(custom)* — client in `../bare-cli-client` | 5 | **CLI channel**: transport = the WS hub; each connection a peer; replies pushed as `chat` events |
 | `src/agent/run-agent-stub.ts` | embedded Pi agent (`runEmbeddedPiAgent`) | 5 | **Stub**: echo instead of the real agent loop |
 | `src/bootstrap.ts` | *(new)* | 1–5 | Orchestrator — stands in for `startGatewayServer` |
 
@@ -353,11 +356,14 @@ entry.ts                         (src/entry.ts)
 
 `bootstrap.ts` calls the same primitives in the same order. The big piece it does
 **not** reproduce is `createGatewayHttpServer()` — in the real daemon that assembles
-the Control UI, OpenAI-compatible HTTP, plugin routes, hooks, and the protocol-v4
-WebSocket/RPC stack. Here, step 4 uses a minimal real `http.createServer` plus a
-real RFC6455 WebSocket upgrade handshake so you can see "one port, both protocols"
-gated by the resolved auth — then stops at the point where the full protocol layer
-would begin.
+the Control UI, OpenAI-compatible HTTP, plugin routes, hooks, and the full RPC stack.
+Here, step 4 uses a minimal real `http.createServer`, and the **WebSocket is now a real
+protocol** (not just the handshake): `src/gateway/ws-frame.ts` (RFC6455 data frames) +
+`src/gateway/ws-hub.ts` speak `PROTOCOL_VERSION = 4` — `connect.challenge → connect →
+hello-ok`, then `{type:"req"|"res"|"event"}` with **pushed events**. That powers the
+`cli` channel (`extensions/cli/`), whose transport *is* the WS hub: each connected
+client is a peer, identified by name, paired independently, and replies are **pushed**
+to it as `chat` events. The companion client lives in `../bare-cli-client/`.
 
 ## What is intentionally left out
 

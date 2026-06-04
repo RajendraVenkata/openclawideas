@@ -36,6 +36,13 @@
       "allowFrom": ["alice"],
       "inbound": { "port": 4000, "path": "/webhook/inbound", "secret": "dev-secret" },
       "outbound": { "url": "http://127.0.0.1:4001/receive" }
+    },
+    "cli": {
+      // CLI clients connect over the gateway WebSocket (:18789). Each connection
+      // is a peer; pairing codes are shown ONLY on this console (not over chat).
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "pairingCodeDelivery": "console"
     }
   }
 }

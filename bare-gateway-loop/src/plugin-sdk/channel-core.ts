@@ -26,6 +26,7 @@ export type ChannelId =
   | "discord"
   | "msteams"
   | "webhook"
+  | "cli"
   | (string & {});
 export type ChatType = "direct" | "group" | "channel";
 

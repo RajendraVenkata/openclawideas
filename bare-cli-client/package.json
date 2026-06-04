@@ -1,0 +1,18 @@
+{
+  "name": "bare-cli-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A TypeScript CLI client that talks to bare-gateway-loop over the gateway WebSocket (send + receive, pairing, multi-client).",
+  "bin": {
+    "bare-cli": "dist/bare-cli.mjs"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "build": "esbuild src/main.ts --bundle --platform=node --target=node22 --format=esm --banner:js='#!/usr/bin/env node' --outfile=dist/bare-cli.mjs && chmod +x dist/bare-cli.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "tsx": "^4.19.2"
+  }
+}

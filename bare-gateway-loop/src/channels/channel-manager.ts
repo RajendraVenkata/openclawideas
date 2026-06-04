@@ -71,7 +71,13 @@ async function startChannel(
         return;
       }
       if (access.action === "pair") {
-        // Issue (or reuse) a persisted pairing request + reply with the code.
+        // Where to surface the code: "console" (gateway log only — never sent over
+        // chat) or "channel" (default; the sender gets it in a reply).
+        const channelCfg = (cfg.channels as Record<string, { pairingCodeDelivery?: string } | undefined>)?.[
+          msg.channel
+        ];
+        const consoleOnly = channelCfg?.pairingCodeDelivery === "console";
+        // Issue (or reuse) a persisted pairing request + (optionally) reply with the code.
         await issuePairingChallenge({
           channel: msg.channel,
           senderId: msg.from,
@@ -83,7 +89,9 @@ async function startChannel(
               accountId: "default",
               meta: p.meta,
             }),
-          sendPairingReply: (text) => deliverReply(plugin, cfg, msg.from, text),
+          sendPairingReply: consoleOnly
+            ? async () => {}
+            : (text) => deliverReply(plugin, cfg, msg.from, text),
           onCreated: ({ code }) =>
             console.log(
               `[security] ${msg.channel}: ${msg.from} not paired → code ${code} ` +

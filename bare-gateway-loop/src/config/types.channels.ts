@@ -14,6 +14,13 @@ export type ChannelSecurityConfig = {
   dmPolicy?: DmPolicy;
   /** Allowlisted sender ids. "*" = everyone. Approved pairings are added at runtime. */
   allowFrom?: Array<string | number>;
+  /** Where the pairing code is shown: "channel" (sent over chat, default) or "console" (gateway log only). */
+  pairingCodeDelivery?: "channel" | "console";
+};
+
+export type CliChannelConfig = ChannelSecurityConfig & {
+  enabled?: boolean;
+  accountId?: string;
 };
 
 export type WhatsAppChannelConfig = ChannelSecurityConfig & {
@@ -59,5 +66,6 @@ export type ChannelsConfig = {
   whatsapp?: WhatsAppChannelConfig;
   msteams?: MSTeamsChannelConfig;
   webhook?: WebhookChannelConfig;
+  cli?: CliChannelConfig;
   // telegram?: …  slack?: …  discord?: …  (omitted in the bare loop)
 };

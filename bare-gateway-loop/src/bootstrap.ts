@@ -14,7 +14,6 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -33,10 +32,12 @@ import {
   listChannelPairingRequests,
   readChannelAllowFromStore,
 } from "./pairing/pairing-store.js";
+import { configureWsHub, handleWsUpgrade } from "./gateway/ws-hub.js";
 // Side-effect imports: register the bundled channel plugins into the catalog.
 import "../extensions/whatsapp/src/register.js";
 import "../extensions/msteams/src/register.js";
 import "../extensions/webhook/src/register.js";
+import "../extensions/cli/src/register.js";
 
 // Reads and JSON-parses a request body (for the simulated-inbound route).
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -183,29 +184,11 @@ function createBareGatewayHttpServer(
     res.end(JSON.stringify({ ok: true, you: "authorized", path: req.url }));
   });
 
-  // Minimal real WebSocket handshake (single multiplexed port).
-  const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  // WebSocket: hand the upgraded socket to the hub, which speaks the real
+  // protocol (connect.challenge → connect → hello-ok → req/res + pushed events).
+  // Auth happens in the `connect` frame (token in params), not the HTTP upgrade.
   httpServer.on("upgrade", (req: IncomingMessage, socket: Socket) => {
-    if (!isAuthorized(req)) {
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-    const key = req.headers["sec-websocket-key"];
-    if (typeof key !== "string") {
-      socket.destroy();
-      return;
-    }
-    const accept = createHash("sha1").update(key + WS_MAGIC).digest("base64");
-    socket.write(
-      "HTTP/1.1 101 Switching Protocols\r\n" +
-        "Upgrade: websocket\r\n" +
-        "Connection: Upgrade\r\n" +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    );
-    // A real gateway now speaks the protocol-v4 frame format here (connect →
-    // hello-ok → events). We just confirm the upgrade succeeded.
-    console.log("[gateway] websocket client upgraded on the multiplexed port");
+    handleWsUpgrade(req, socket);
   });
 
   return httpServer;
@@ -258,6 +241,16 @@ async function main() {
   // handler reads it at request time, so late population works (same closure
   // trick as getAuth()).
   const channelsById = new Map<string, StartedChannel>();
+
+  // Configure the WS hub's auth: a `connect` frame's token must match the
+  // resolved gateway token (read live, so hot-reload applies).
+  configureWsHub({
+    verifyToken: (token) => {
+      if (resolvedAuth.mode === "none") return true;
+      const expected = resolvedAuth.mode === "password" ? resolvedAuth.password : resolvedAuth.token;
+      return Boolean(expected) && token === expected;
+    },
+  });
 
   // STEP 4: create the multiplexed HTTP/WS server and bind it.
   const httpServer = createBareGatewayHttpServer(() => resolvedAuth, channelsById);
