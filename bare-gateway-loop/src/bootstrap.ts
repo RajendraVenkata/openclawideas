@@ -28,9 +28,15 @@ import { startGatewayConfigReloader } from "./gateway/config-reload.js";
 import { listenGatewayHttpServer } from "./gateway/server/http-listen.js";
 import { startChannels, stopChannels, type StartedChannel } from "./channels/channel-manager.js";
 import { runAgent } from "./agent/run-agent-stub.js";
+import {
+  approveChannelPairingCode,
+  listChannelPairingRequests,
+  readChannelAllowFromStore,
+} from "./pairing/pairing-store.js";
 // Side-effect imports: register the bundled channel plugins into the catalog.
 import "../extensions/whatsapp/src/register.js";
 import "../extensions/msteams/src/register.js";
+import "../extensions/webhook/src/register.js";
 
 // Reads and JSON-parses a request body (for the simulated-inbound route).
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -129,6 +135,45 @@ function createBareGatewayHttpServer(
       return;
     }
 
+    // PAIRING — operator approves a pending sender (mirrors `openclaw pairing approve`).
+    // POST /pairing/approve { channel, code }
+    if (req.method === "POST" && req.url === "/pairing/approve") {
+      if (!isAuthorized(req)) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: { code: "UNAUTHORIZED" } }));
+        return;
+      }
+      const body = await readJsonBody(req);
+      const channel = String(body.channel ?? "");
+      const code = String(body.code ?? "");
+      const result = await approveChannelPairingCode({ channel, code, accountId: "default" });
+      if (!result) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: { code: "NO_SUCH_CODE" } }));
+        return;
+      }
+      console.log(`[security] ${channel}: approved ${result.id} (code ${code})`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, channel, approved: result.id }));
+      return;
+    }
+
+    // GET /pairing/list?channel=<id> — pending requests + persisted approved senders.
+    const pairingListMatch = req.method === "GET" && (req.url ?? "").startsWith("/pairing/list");
+    if (pairingListMatch) {
+      if (!isAuthorized(req)) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: { code: "UNAUTHORIZED" } }));
+        return;
+      }
+      const channel = new URL(req.url ?? "", "http://localhost").searchParams.get("channel") ?? "";
+      const pending = await listChannelPairingRequests(channel, process.env, "default");
+      const approved = await readChannelAllowFromStore(channel, process.env, "default");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, channel, pending, approved }));
+      return;
+    }
+
     if (!isAuthorized(req)) {
       res.writeHead(401, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: { code: "UNAUTHORIZED" } }));
@@ -220,6 +265,7 @@ async function main() {
   console.log(`[gateway] step 4 — listening on ws://${bindHost}:${port}  (HTTP + WebSocket)`);
 
   // STEP 5: load enabled channel plugins from the catalog + start their transports.
+  // (Inbound security uses the persistent pairing store in src/pairing/.)
   const channels = await startChannels(cfg, { runAgent });
   for (const channel of channels) {
     channelsById.set(channel.id, channel);

@@ -13,6 +13,9 @@ import type { ChannelConnection, ChannelId, ChannelPlugin } from "../plugin-sdk/
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getEnabledChannelPlugins } from "./plugins/catalog.js";
 import { resolveInboundRoute, formatInboundEnvelope } from "../plugin-sdk/inbound-envelope.js";
+import { resolveInboundAccess } from "./security/inbound-gate.js";
+import { issuePairingChallenge } from "../pairing/pairing-challenge.js";
+import { upsertChannelPairingRequest } from "../pairing/pairing-store.js";
 
 export type ChannelManagerDeps = {
   // The agent: given the envelope text, produce a reply (or null).
@@ -26,13 +29,18 @@ export type StartedChannel = {
 
 // Deliver an outbound reply through the plugin's message adapter (real path:
 // message.send.text → outbound.sendText → sendMessageWhatsApp → transport).
-async function deliverReply(plugin: ChannelPlugin, to: string, text: string): Promise<void> {
+async function deliverReply(
+  plugin: ChannelPlugin,
+  cfg: OpenClawConfig,
+  to: string,
+  text: string,
+): Promise<void> {
   if (plugin.message) {
-    await plugin.message.send.text({ to, text });
+    await plugin.message.send.text({ to, text, cfg });
     return;
   }
   if (plugin.outbound) {
-    await plugin.outbound.sendText({ to, text });
+    await plugin.outbound.sendText({ to, text, cfg });
   }
 }
 
@@ -50,6 +58,41 @@ async function startChannel(
     accountId: "default",
     cfg,
     onInbound: async (msg) => {
+      // (0) INBOUND SECURITY GATE — dmPolicy / allowFrom / pairing (real openclaw
+      // treats inbound DMs as untrusted; only allowed senders reach the agent).
+      const access = await resolveInboundAccess({
+        cfg,
+        channel: msg.channel,
+        sender: msg.from,
+        accountId: "default",
+      });
+      if (access.action === "deny") {
+        console.log(`[security] ${msg.channel}: denied ${msg.from} — ${access.reason}`);
+        return;
+      }
+      if (access.action === "pair") {
+        // Issue (or reuse) a persisted pairing request + reply with the code.
+        await issuePairingChallenge({
+          channel: msg.channel,
+          senderId: msg.from,
+          senderIdLine: `Sender: ${msg.from}`,
+          upsertPairingRequest: (p) =>
+            upsertChannelPairingRequest({
+              channel: msg.channel,
+              id: p.id,
+              accountId: "default",
+              meta: p.meta,
+            }),
+          sendPairingReply: (text) => deliverReply(plugin, cfg, msg.from, text),
+          onCreated: ({ code }) =>
+            console.log(
+              `[security] ${msg.channel}: ${msg.from} not paired → code ${code} ` +
+                `(approve: POST /pairing/approve {"channel":"${msg.channel}","code":"${code}"})`,
+            ),
+        });
+        return;
+      }
+
       // (1) route: channel/peer → agentId + sessionKey
       const route = resolveInboundRoute({
         cfg,
@@ -64,7 +107,7 @@ async function startChannel(
       const reply = await deps.runAgent(envelopeText);
       // (4) deliver the reply back out the same channel
       if (reply) {
-        await deliverReply(plugin, msg.from, reply);
+        await deliverReply(plugin, cfg, msg.from, reply);
       }
     },
   });

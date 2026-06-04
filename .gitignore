@@ -43,3 +43,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# bare-gateway-loop pairing state
+.openclaw-state/

@@ -30,6 +30,7 @@ export const whatsappMessageAdapter = defineChannelMessageAdapter({
       const result = await whatsappChannelOutbound.sendText({
         to: ctx.to,
         text: ctx.text,
+        cfg: ctx.cfg,
         replyToId: ctx.replyToId,
       });
       return { messageId: result.messageId };

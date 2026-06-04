@@ -24,7 +24,18 @@
       "enabled": true,
       "accountId": "default",
       "appId": "00000000-0000-0000-0000-000000000000",
-      "tenantId": "contoso.onmicrosoft.com"
+      "tenantId": "contoso.onmicrosoft.com",
+      "dmPolicy": "open"
+    },
+    "webhook": {
+      "enabled": true,
+      "accountId": "default",
+      // Inbound security (real openclaw model): pairing → unknown senders get a
+      // code and aren't processed until an operator approves. "alice" is allowlisted.
+      "dmPolicy": "pairing",
+      "allowFrom": ["alice"],
+      "inbound": { "port": 4000, "path": "/webhook/inbound", "secret": "dev-secret" },
+      "outbound": { "url": "http://127.0.0.1:4001/receive" }
     }
   }
 }

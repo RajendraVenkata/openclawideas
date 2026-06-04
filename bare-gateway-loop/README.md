@@ -197,6 +197,89 @@ to `:3978/api/messages`, and a sideloaded Teams app manifest. Then set `appPassw
 > it real means `adapter.continueConversation(ref)` using the stored conversation
 > reference — which the read path already saves.
 
+#### A third channel — Custom Webhook
+
+A custom **webhook** channel (`extensions/webhook/`) — added exactly like the others,
+no catalog/manager changes. Inbound over an HTTP webhook on its **own port 4000**;
+outbound delivered **asynchronously** to a configured callback URL (or printed when
+none is set). It proves the pattern handles a channel you invented, not just the
+bundled ones.
+
+```bash
+curl -s -i -H "X-Webhook-Secret: dev-secret" -H "content-type: application/json" \
+  -d '{"from":"alice","text":"through the loop"}' \
+  http://127.0.0.1:4000/webhook/inbound
+# → HTTP 202 {"ok":true,"accepted":true}
+# console: 📥 [webhook ← alice] through the loop
+#          [channels] routed → agent:main:main          ← runs through the LOOP's agent
+#          📤 [webhook → alice] 🤖 (echo agent) [webhook] from alice: through the loop …
+```
+
+Wrong/missing `X-Webhook-Secret` → `401`. To watch the async **outbound** POST, add
+`"outbound": { "url": "http://127.0.0.1:4001/receive" }` to `channels.webhook` and run a
+receiver on :4001.
+
+This channel was first built standalone in `../custom-webhook-channel/`, then ported
+here. The only shared-SDK change it needed: **`cfg` is now threaded through the send
+context** (`ChannelMessageSendContext` / `ChannelOutboundAdapter.sendText`) so a channel
+can read delivery settings (the outbound URL) at send time — WhatsApp/MS Teams ignore it.
+
+### Inbound security model — `dmPolicy` / `allowFrom` / pairing
+
+Every channel's inbound runs through a shared **security gate** before reaching the
+agent — faithful to real openclaw, which treats inbound DMs as **untrusted input**.
+Per `channels.<id>.dmPolicy` (default **`pairing`**, secure):
+
+| dmPolicy | behavior |
+|---|---|
+| `open` | process everyone |
+| `disabled` | drop all DMs |
+| `allowlist` | process only `allowFrom` (no pairing; approved store ignored) |
+| `pairing` | process if in `allowFrom` **or** approved; else issue a **pairing code** and don't run the agent until an operator approves |
+
+The gate uses the genuine pieces: **`isSenderIdAllowed`** (copied verbatim from
+`openclaw/src/channels/allow-from.ts`), **`mergeDmAllowFromSources`** (config allowFrom +
+approved store, except for `allowlist`/`open`), **`issuePairingChallenge`**, and a
+**persistent pairing store** (`src/pairing/` — mirrors `openclaw/src/pairing/`).
+
+In the default config, `webhook` is `dmPolicy: "pairing"` with `allowFrom: ["alice"]`.
+Try the full flow:
+
+```bash
+# alice is allowlisted → processed
+curl -s -H "X-Webhook-Secret: dev-secret" -H "content-type: application/json" \
+  -d '{"from":"alice","text":"hi"}' http://127.0.0.1:4000/webhook/inbound
+
+# bob is unknown → gets a pairing code, NOT processed:
+curl -s -H "X-Webhook-Secret: dev-secret" -H "content-type: application/json" \
+  -d '{"from":"bob","text":"let me in"}' http://127.0.0.1:4000/webhook/inbound
+# console: [security] webhook: bob not paired → code B1A323 …
+#          📤 [webhook → bob] 🔒 Pairing required. Your code: B1A323 …
+
+# operator lists + approves (mirrors `openclaw pairing approve`):
+curl -s -H "Authorization: Bearer dev-secret-token" \
+  "http://127.0.0.1:18789/pairing/list?channel=webhook"
+curl -s -H "Authorization: Bearer dev-secret-token" -H "content-type: application/json" \
+  -d '{"channel":"webhook","code":"B1A323"}' http://127.0.0.1:18789/pairing/approve
+
+# bob retries → now processed by the agent
+curl -s -H "X-Webhook-Secret: dev-secret" -H "content-type: application/json" \
+  -d '{"from":"bob","text":"thanks"}' http://127.0.0.1:4000/webhook/inbound
+```
+
+This is a different (and more important) gate than the webhook's `X-Webhook-Secret` /
+the gateway token: it authorizes **who** may talk to the agent, not just whether a
+request reached a port.
+
+**Approvals persist** (like real openclaw). The pairing store writes two JSON files per
+channel under a state dir (`OPENCLAW_STATE_DIR`, default `./.openclaw-state/`):
+`credentials/pairing/<channel>-pairing.json` (pending requests) and
+`…-<account>-allow-from.json` (approved senders, e.g. `{"version":1,"allowFrom":["bob"]}`).
+So if you approve `bob`, then **restart the gateway**, `bob` is still approved — his next
+message goes straight to the agent, no new code. (Real openclaw uses the same
+`upsertChannelPairingRequest` / `approveChannelPairingCode` / `readChannelAllowFromStore`
+functions, persisted under `~/.openclaw/`.)
+
 ### Try the other precedence rules
 
 ```bash
@@ -228,7 +311,10 @@ Every file names its origin at the top. Relative paths mirror the real repo.
 | `src/plugin-sdk/channel-core.ts` | `src/channels/plugins/{channel-id.types,types.core,types.adapters,types.plugin}.ts` + `src/plugin-sdk/channel-{core,message}.ts` | 5 | **Faithful subset**: real names (`ChannelPlugin`, `createChatChannelPlugin`, `defineChannelMessageAdapter`); ~40 adapters → a few |
 | `src/plugin-sdk/inbound-envelope.ts` | same | 5 | **Faithful subset**: `resolveInboundRoute` + envelope formatting |
 | `src/channels/plugins/catalog.ts` | `src/channels/plugins/catalog.ts` + `src/plugins/*` | 5 | **Faithful subset**: plugin registry + enabled-plugin lookup |
-| `src/channels/channel-manager.ts` | gateway channel subsystem | 5 | **Faithful shape**: connect transports, route inbound, deliver replies |
+| `src/channels/channel-manager.ts` | gateway channel subsystem | 5 | **Faithful shape**: connect transports, **inbound security gate**, route inbound, deliver replies |
+| `src/channels/security/allow-from.ts` | `src/channels/allow-from.ts` | 5 | **Verbatim** `isSenderIdAllowed` + faithful `mergeDmAllowFromSources`, `DmPolicy` |
+| `src/channels/security/inbound-gate.ts` | gateway inbound gate | 5 | **Faithful**: dmPolicy decision (open/disabled/allowlist/pairing) |
+| `src/pairing/{pairing-store,allow-from-store-file,pairing-store.types,pairing-challenge,pairing-messages,json-file}.ts` | `openclaw/src/pairing/*` | 5 | **Faithful subset**: `upsertChannelPairingRequest`, `approveChannelPairingCode`, `readChannelAllowFromStore`, `issuePairingChallenge` — **persisted to disk** |
 | `extensions/whatsapp/src/channel.ts` | `extensions/whatsapp/src/channel.ts` | 5 | **Faithful**: `whatsappPlugin = createChatChannelPlugin({…})` (adapter subset) |
 | `extensions/whatsapp/src/channel-outbound.ts` | same | 5 | **Faithful**: `whatsappChannelOutbound` + `whatsappMessageAdapter` |
 | `extensions/whatsapp/src/send.ts` | same | 5 | **Simulated leaf**: `sendMessageWhatsApp` prints instead of Baileys |
@@ -236,6 +322,7 @@ Every file names its origin at the top. Relative paths mirror the real repo.
 | `extensions/whatsapp/src/{accounts,register}.ts` | same | 5 | **Faithful subset**: account resolve + bundled registration |
 | `extensions/msteams/src/{channel,channel-outbound,send,accounts,register}.ts` | same | 5 | **Faithful subset**: `msteamsPlugin`, `sendMessageMSTeams`, `createChannelMessageAdapterFromOutbound` (outbound simulated) |
 | `extensions/msteams/src/{monitor,monitor-handler,sdk,token,conversation-store}.ts` | same | 5 | **Faithful + real read path**: `monitorMSTeamsProvider` Bot Framework webhook (`/api/messages`:3978), activity-type dispatch, JWT validator (local mode), conversation store |
+| `extensions/webhook/src/*.ts` | *(custom)* — ported from `../custom-webhook-channel` | 5 | **Custom channel**: HTTP webhook inbound (:4000) + async outbound POST; same `ChannelPlugin` contract |
 | `src/agent/run-agent-stub.ts` | embedded Pi agent (`runEmbeddedPiAgent`) | 5 | **Stub**: echo instead of the real agent loop |
 | `src/bootstrap.ts` | *(new)* | 1–5 | Orchestrator — stands in for `startGatewayServer` |
 

@@ -19,7 +19,14 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 // ── Identity (src/channels/plugins/channel-id.types.ts) ─────────────────────
 // `(string & {})` keeps autocomplete for the known ids while still allowing any
 // string — this is the real trick from the codebase.
-export type ChannelId = "whatsapp" | "telegram" | "slack" | "discord" | "msteams" | (string & {});
+export type ChannelId =
+  | "whatsapp"
+  | "telegram"
+  | "slack"
+  | "discord"
+  | "msteams"
+  | "webhook"
+  | (string & {});
 export type ChatType = "direct" | "group" | "channel";
 
 // ── ChannelMeta (verbatim-trimmed from src/channels/plugins/types.core.ts) ──
@@ -45,7 +52,12 @@ export type ChannelCapabilities = {
 // ── Outbound + message adapters (src/plugin-sdk/channel-message.ts) ─────────
 // The leaf delivery shape the channel's outbound base exposes.
 export type ChannelOutboundAdapter = {
-  sendText: (params: { to: string; text: string; replyToId?: string | null }) => Promise<{
+  sendText: (params: {
+    to: string;
+    text: string;
+    cfg: OpenClawConfig;
+    replyToId?: string | null;
+  }) => Promise<{
     messageId: string;
   }>;
 };
@@ -53,6 +65,9 @@ export type ChannelOutboundAdapter = {
 export type ChannelMessageSendContext = {
   to: string;
   text: string;
+  // The in-memory config snapshot — some channels (e.g. webhook) read delivery
+  // settings from it at send time. Channels that don't need it just ignore it.
+  cfg: OpenClawConfig;
   replyToId?: string | null;
 };
 
@@ -92,6 +107,7 @@ export function createChannelMessageAdapterFromOutbound(params: {
         const result = await params.outbound.sendText({
           to: ctx.to,
           text: ctx.text,
+          cfg: ctx.cfg,
           replyToId: ctx.replyToId,
         });
         return { messageId: result.messageId };

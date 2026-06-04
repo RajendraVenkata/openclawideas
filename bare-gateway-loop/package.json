@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Faithful extraction of OpenClaw gateway startup steps 1-4 (port, auth, hot-reload, HTTP/WS listen).",
   "scripts": {
-    "start": "tsx src/bootstrap.ts"
+    "start": "tsx src/bootstrap.ts",
+    "receiver": "node receiver.mjs"
   },
   "devDependencies": {
     "tsx": "^4.19.2"
