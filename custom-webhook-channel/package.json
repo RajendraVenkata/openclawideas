@@ -1,0 +1,14 @@
+{
+  "name": "custom-webhook-channel",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A standalone custom Webhook channel — inbound via HTTP POST, outbound via async callback URL. Self-contained (own minimal ChannelPlugin SDK).",
+  "scripts": {
+    "start": "tsx src/bootstrap.ts",
+    "receiver": "node receiver.mjs"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  // Custom webhook channel config.
+  "channels": {
+    "webhook": {
+      "enabled": true,
+      "inbound": { "port": 4000, "path": "/webhook/inbound", "secret": "dev-secret" }
+      // To see the async OUTBOUND round-trip: uncomment below, then run `npm run receiver`.
+      // "outbound": { "url": "http://127.0.0.1:4001/receive" }
+    }
+  }
+}
